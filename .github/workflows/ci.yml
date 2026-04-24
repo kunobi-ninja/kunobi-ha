@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Rust Checks
+    runs-on: kunobi-runners
+    container:
+      image: rust:1.93-bookworm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Add Rust components
+        run: rustup component add rustfmt clippy
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-features
+
+      - name: Security audit
+        run: |
+          cargo install cargo-audit --locked || true
+          cargo audit
+
+      - name: Check outdated dependencies
+        run: |
+          cargo install cargo-outdated --locked || true
+          cargo outdated --exit-code 1 --depth 1 || echo "::warning::Some direct dependencies are outdated"
