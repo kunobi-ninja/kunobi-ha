@@ -10,9 +10,12 @@ keywords = ["kubernetes", "leader-election", "lease", "controller", "operator"]
 categories = ["asynchronous", "web-programming"]
 
 [dependencies]
-# Kubernetes
+# Kubernetes — library crates MUST NOT enable a specific version feature on
+# k8s-openapi; it is up to the binary consumer to pick `v1_xx` so there is
+# only one version across the dependency tree. `dev-dependencies` below
+# enable `latest` so our own tests can run standalone.
 kube = { version = "3", features = ["client"], default-features = false }
-k8s-openapi = { version = "0.27", features = ["latest"] }
+k8s-openapi = "0.27"
 
 # Async
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
@@ -37,3 +40,6 @@ anyhow = "1"
 serde_json = "1"
 http = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# Pick a k8s-openapi version so our own tests can build. Binary consumers
+# of kunobi-ha must activate their own `v1_xx` feature instead.
+k8s-openapi = { version = "0.27", features = ["latest"] }
