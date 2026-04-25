@@ -15,6 +15,23 @@ same 300-line Lease dance into every operator leads to subtle bugs and
 drift over time. This crate hosts the shared implementation once, with
 real tests.
 
+## Installation
+
+Like every crate that depends on [`k8s-openapi`], the final binary must
+pick the Kubernetes API version it targets. `kunobi-ha` re-exports
+`k8s-openapi`'s version flags as proxy features, so you can do this from
+your own `Cargo.toml`:
+
+```toml
+[dependencies]
+kunobi-ha = { version = "0.1", features = ["v1_31"] }
+```
+
+Available proxy features: `v1_31`, `v1_32`, `v1_33`, `v1_34`, `v1_35`,
+`latest`. Pick the **minimum** Kubernetes API version your operator
+needs to support. If you already depend on `k8s-openapi` directly with
+a `v1_xx` feature enabled, you don't need a proxy feature here.
+
 ## Leader election
 
 ```rust
@@ -69,7 +86,8 @@ Follows the Kubernetes reference (`leaderelection.LeaderElectionConfig`):
   `holder_identity` on the Lease so the next replica takes over within
   `retry_period` instead of waiting for the full TTL. Most reference
   implementations (including the original Go one) leave this optional —
-  we make it ergonomic.
+  we make it ergonomic, and the acquire path notices a cleared holder
+  immediately rather than waiting for renewal expiry.
 - **Deadline-based, not failure-count-based.** A leader steps down when
   it has been unable to renew for longer than `renew_deadline`, not
   after N consecutive failures. Handles flappy networks more gracefully.
@@ -106,3 +124,5 @@ Future modules as we see duplication pop up across Kunobi operators:
 ## License
 
 Apache-2.0
+
+[`k8s-openapi`]: https://crates.io/crates/k8s-openapi
