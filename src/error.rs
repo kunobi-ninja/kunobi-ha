@@ -18,6 +18,12 @@ pub enum Error {
     /// restarts.
     #[error("failed to observe or acquire leader lease within {0:?}: {1}")]
     ObserveTimeout(std::time::Duration, Box<Error>),
+
+    /// The configuration handed to `LeaderElection::acquire` violates
+    /// an invariant of the algorithm (e.g. `renew_deadline` is not
+    /// strictly less than `lease_duration`).
+    #[error("invalid leader-election config: {0}")]
+    InvalidConfig(String),
 }
 
 /// Convenience `Result` alias.

@@ -51,10 +51,10 @@ async fn main() -> anyhow::Result<()> {
     // Block until we're leader.
     let mut guard = leader.acquire().await?;
 
-    // Start your controllers here. `guard.changed()` fires when we lose
+    // Start your controllers here. `guard.lost()` fires when we lose
     // the lease (renewal failed past `renew_deadline`).
     tokio::select! {
-        _ = guard.changed() => {
+        _ = guard.lost() => {
             eprintln!("lost leader lease, shutting down");
         }
         _ = run_my_controllers() => {}

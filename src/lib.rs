@@ -17,7 +17,7 @@
 //! let leader = LeaderElection::builder(client, "my-ns", "my-operator").build();
 //! let mut guard = leader.acquire().await?;
 //!
-//! // Start your controllers here. `guard.changed()` fires when we lose
+//! // Start your controllers here. `guard.lost()` fires when we lose
 //! // the lease (renewal failed past `renew_deadline`).
 //! // Call `guard.step_down().await` in your SIGTERM handler to let the
 //! // next replica take over immediately instead of waiting for TTL.
