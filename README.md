@@ -69,6 +69,15 @@ async fn main() -> anyhow::Result<()> {
 # async fn run_my_controllers() {}
 ```
 
+A minimal runnable demo lives at [`examples/leader.rs`](examples/leader.rs):
+
+```bash
+KUNOBI_NS=default KUNOBI_LEASE=demo cargo run --example leader
+```
+
+Run two copies in separate terminals to watch one stand by while the
+other holds the lease, then `Ctrl-C` the leader to see takeover.
+
 ### Timing model
 
 Follows the Kubernetes reference (`leaderelection.LeaderElectionConfig`):
@@ -79,6 +88,11 @@ Follows the Kubernetes reference (`leaderelection.LeaderElectionConfig`):
 | `renew_deadline`  | 10s     | Leader must renew within this window; otherwise it steps down |
 | `retry_period`    | 2s      | Renewal cadence (leader) / poll cadence (follower)            |
 | `observe_timeout` | 5m      | Initial-acquire loop bails if API is unreachable this long    |
+
+`acquire()` rejects nonsensical configurations
+(`renew_deadline >= lease_duration`, `retry_period > renew_deadline`,
+zero `retry_period`, empty identity/name/namespace) with
+`Error::InvalidConfig` rather than silently misbehaving.
 
 ### Key differences from the Kubernetes reference
 
@@ -111,6 +125,14 @@ cargo test
 
 Tests use `wiremock` to simulate the Kubernetes API — no real cluster
 needed.
+
+Dependency hygiene is checked with [`cargo-deny`](https://embarkstudios.github.io/cargo-deny/):
+
+```bash
+cargo deny check
+```
+
+Configuration lives in [`deny.toml`](deny.toml).
 
 ## Roadmap
 
