@@ -20,10 +20,10 @@
 //! // TTL to expire).
 //! let mut guard = leader.acquire().await?;
 //!
-//! // Start controllers here, watching `guard.changed()` for step-down.
+//! // Start controllers here, watching `guard.lost()` for step-down.
 //! loop {
 //!     tokio::select! {
-//!         _ = guard.changed() => {
+//!         _ = guard.lost() => {
 //!             // Lost leadership (renewal failed past `renew_deadline`).
 //!             break;
 //!         }
@@ -198,10 +198,12 @@ impl LeaderElection {
     /// that keeps the lease renewed in the background.
     ///
     /// The returned [`LeaderGuard`] should be held for the lifetime of the
-    /// controllers. Call [`LeaderGuard::changed`] to wait for step-down
+    /// controllers. Call [`LeaderGuard::lost`] to wait for step-down
     /// events (lost renewal), and [`LeaderGuard::step_down`] in your
     /// shutdown path to relinquish the lease cooperatively.
     pub async fn acquire(&self) -> Result<LeaderGuard> {
+        self.validate()?;
+
         let leases: Api<Lease> = Api::namespaced(self.client.clone(), &self.namespace);
 
         info!(identity = %self.identity, lease = %self.name, "starting leader election");
@@ -237,6 +239,7 @@ impl LeaderElection {
             let identity = self.identity.clone();
             let retry_period = self.retry_period;
             let renew_deadline = self.renew_deadline;
+            let lease_duration = self.lease_duration;
             let renew_request_timeout = self.renew_request_timeout;
             async move {
                 renew_loop(
@@ -244,6 +247,7 @@ impl LeaderElection {
                     &namespace,
                     &name,
                     &identity,
+                    lease_duration,
                     retry_period,
                     renew_deadline,
                     renew_request_timeout,
@@ -261,6 +265,41 @@ impl LeaderElection {
             rx,
             renew_handle: Some(handle),
         })
+    }
+
+    fn validate(&self) -> Result<()> {
+        // The 2/3 rule: a leader must finish renewing within
+        // `renew_deadline`, which has to leave enough margin under
+        // `lease_duration` for the next replica to safely treat the
+        // lease as expired. Without this gap, a brief renewal hiccup
+        // can race a takeover and produce two leaders.
+        if self.renew_deadline >= self.lease_duration {
+            return Err(Error::InvalidConfig(format!(
+                "renew_deadline ({:?}) must be strictly less than lease_duration ({:?})",
+                self.renew_deadline, self.lease_duration,
+            )));
+        }
+        if self.retry_period > self.renew_deadline {
+            return Err(Error::InvalidConfig(format!(
+                "retry_period ({:?}) must be <= renew_deadline ({:?})",
+                self.retry_period, self.renew_deadline,
+            )));
+        }
+        if self.retry_period.is_zero() {
+            return Err(Error::InvalidConfig(
+                "retry_period must be greater than zero".into(),
+            ));
+        }
+        if self.identity.is_empty() {
+            return Err(Error::InvalidConfig("identity must not be empty".into()));
+        }
+        if self.name.is_empty() {
+            return Err(Error::InvalidConfig("lease name must not be empty".into()));
+        }
+        if self.namespace.is_empty() {
+            return Err(Error::InvalidConfig("namespace must not be empty".into()));
+        }
+        Ok(())
     }
 }
 
@@ -280,13 +319,21 @@ pub struct LeaderGuard {
 }
 
 impl LeaderGuard {
-    /// Wait for the next change in leadership state. Returns `Ok(())` when
-    /// the status flips (typically to `false` — i.e. we lost the lease).
+    /// Wait until this instance is no longer leader.
     ///
-    /// After observing `false`, the caller should shut down its controllers
-    /// and exit the pod; a new leader will pick up the work.
-    pub async fn changed(&mut self) -> std::result::Result<(), watch::error::RecvError> {
-        self.rx.changed().await
+    /// Resolves once the renewal task has signalled stepdown — either
+    /// because we lost the lease (renewal failed past `renew_deadline`,
+    /// or another instance now holds it) or because the renewal task
+    /// was aborted (e.g. by [`step_down`](Self::step_down) or guard
+    /// drop). Returns immediately on subsequent calls; safe to use in
+    /// `tokio::select!` next to your controller futures as a stepdown
+    /// signal.
+    pub async fn lost(&mut self) {
+        // `watch::Receiver::changed` returns Err only when all senders
+        // are dropped, which here means the renewal task has ended —
+        // either because it signalled stepdown (sender drops on return)
+        // or because it was aborted. Both mean "we're no longer leader."
+        let _ = self.rx.changed().await;
     }
 
     /// `true` while we still hold the lease.
@@ -533,13 +580,14 @@ async fn renew_loop(
     namespace: &str,
     lease_name: &str,
     identity: &str,
+    lease_duration: Duration,
     retry_period: Duration,
     renew_deadline: Duration,
     renew_request_timeout: Duration,
     tx: watch::Sender<bool>,
 ) {
     let leases: Api<Lease> = Api::namespaced(client, namespace);
-    let lease_secs = renew_deadline_to_duration(renew_deadline).as_secs() as i32;
+    let lease_secs = lease_duration.as_secs() as i32;
     let mut interval = tokio::time::interval(retry_period);
     // Tick once immediately after acquire to avoid the first-tick burst
     // race with the initial create/replace.
@@ -590,15 +638,6 @@ async fn renew_loop(
     }
 }
 
-// Explicit helper so that if the caller supplies an unusual combination
-// (e.g. renew_deadline > lease_duration, which makes no sense), we still
-// produce a sensible `lease_duration_seconds` for the Lease spec.
-fn renew_deadline_to_duration(renew_deadline: Duration) -> Duration {
-    // Use renew_deadline + 5s as the Lease TTL, aligning with the
-    // Kubernetes reference default ratio.
-    renew_deadline + Duration::from_secs(5)
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -647,6 +686,67 @@ mod tests {
         );
         Client::try_from(config).expect("build mock kube client")
     }
+
+    // -----------------------------------------------------------------------
+    // Config validation
+    // -----------------------------------------------------------------------
+
+    fn election_with(
+        client: Client,
+        lease_duration: Duration,
+        renew_deadline: Duration,
+        retry_period: Duration,
+    ) -> LeaderElection {
+        LeaderElection::builder(client, "ns", "lease")
+            .identity("me")
+            .lease_duration(lease_duration)
+            .renew_deadline(renew_deadline)
+            .retry_period(retry_period)
+            .build()
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_renew_deadline_ge_lease_duration() {
+        let server = MockServer::start().await;
+        let le = election_with(
+            mock_client(&server),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+        );
+        let err = le.acquire().await.err().expect("must reject renew>=lease");
+        assert!(matches!(err, Error::InvalidConfig(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_retry_gt_renew_deadline() {
+        let server = MockServer::start().await;
+        let le = election_with(
+            mock_client(&server),
+            Duration::from_secs(15),
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+        );
+        let err = le.acquire().await.err().expect("must reject retry>renew");
+        assert!(matches!(err, Error::InvalidConfig(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_zero_retry_period() {
+        let server = MockServer::start().await;
+        let le = election_with(
+            mock_client(&server),
+            Duration::from_secs(15),
+            Duration::from_secs(10),
+            Duration::ZERO,
+        );
+        let err = le.acquire().await.err().expect("must reject zero retry");
+        assert!(matches!(err, Error::InvalidConfig(_)), "got {err:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // try_acquire / renew_lease against a mocked Kubernetes API
+    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn try_acquire_creates_lease_when_absent() {

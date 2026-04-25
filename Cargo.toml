@@ -49,14 +49,21 @@ tracing = "0.1"
 [dev-dependencies]
 # Wiremock for simulating the Kubernetes API in unit tests — no real cluster needed.
 wiremock = "0.6"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+# `signal` for the example; multi-thread runtime + macros for both tests
+# and the example.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "signal"] }
 anyhow = "1"
 serde_json = "1"
 http = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Pick a k8s-openapi version so our own tests can build. Binary consumers
 # of kunobi-ha must activate their own `v1_xx` feature instead.
 k8s-openapi = { version = "0.27", features = ["latest"] }
+
+[[example]]
+name = "leader"
+path = "examples/leader.rs"
 
 [package.metadata.docs.rs]
 # docs.rs builds the lib without dev-dependencies, so a k8s-openapi

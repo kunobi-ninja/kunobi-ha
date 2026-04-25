@@ -1,0 +1,46 @@
+[graph]
+# Check the full target graph (no target filtering).
+all-features = false
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Fail the build on any active advisory or yanked dep. Use `ignore` to
+# pin specific advisory IDs after a documented decision.
+yanked = "deny"
+ignore = []
+
+[bans]
+# Multiple versions of the same crate inflate binary size and signal
+# upgrade churn. Warn (not deny) — perfect uniqueness is impractical
+# in a Kubernetes-adjacent dependency graph.
+multiple-versions = "warn"
+wildcards = "deny"
+deny = []
+skip = []
+skip-tree = []
+
+[licenses]
+# Permissive licenses we're happy to ship under Apache-2.0.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "MPL-2.0",
+    "Unlicense",
+]
+confidence-threshold = 0.93
+exceptions = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
