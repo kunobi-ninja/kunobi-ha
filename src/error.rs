@@ -18,12 +18,6 @@ pub enum Error {
     /// restarts.
     #[error("failed to observe or acquire leader lease within {0:?}: {1}")]
     ObserveTimeout(std::time::Duration, Box<Error>),
-
-    /// The leader lost the lease (renewal kept failing past `renew_deadline`).
-    /// Emitted through the watch channel as `Ok(false)` rather than this
-    /// error; this variant exists for explicit handling.
-    #[error("lost leader lease — another instance took over or API was unreachable")]
-    Stepped,
 }
 
 /// Convenience `Result` alias.
