@@ -11,22 +11,32 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+
 jobs:
   checks:
     name: Rust Checks
     runs-on: kunobi-runners
     container:
       image: rust:1.93-bookworm
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
       - name: Cache cargo
         uses: actions/cache@v4
         with:
+          # `~/.cargo/bin` caches `cargo-audit` / `cargo-outdated` so
+          # we don't recompile them on every run. Splitting registry
+          # into index/cache (skipping `src`) keeps the cache smaller.
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
             target
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
@@ -37,18 +47,38 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
-      - name: Clippy (all features)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      # Verify the library compiles standalone with each end of the
+      # supported k8s-openapi version range. This is the only place that
+      # builds the lib without dev-dependencies, so it's the only place
+      # that catches an accidental version pin in `[dependencies]`.
+      # We deliberately do NOT use `--all-features` here: the version
+      # proxy features (`v1_31` … `latest`) are mutually exclusive on
+      # k8s-openapi, and enabling them all at once is a build error.
+      - name: Build lib (minimum supported version)
+        run: cargo build --lib --features v1_31
+
+      - name: Build lib (latest)
+        run: cargo build --lib --features latest
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Tests
-        run: cargo test --all-features
+        run: cargo test
+
+      - name: Build docs
+        run: cargo doc --lib --no-deps --features latest
 
       - name: Security audit
         run: |
-          cargo install cargo-audit --locked || true
+          if ! command -v cargo-audit >/dev/null; then
+            cargo install cargo-audit --locked
+          fi
           cargo audit
 
       - name: Check outdated dependencies
         run: |
-          cargo install cargo-outdated --locked || true
+          if ! command -v cargo-outdated >/dev/null; then
+            cargo install cargo-outdated --locked
+          fi
           cargo outdated --exit-code 1 --depth 1 || echo "::warning::Some direct dependencies are outdated"

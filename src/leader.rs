@@ -369,24 +369,31 @@ async fn try_acquire(
                 return renew_existing_lease(leases, name, existing, identity, lease_secs).await;
             }
 
-            let expired = match renew_time {
-                Some(MicroTime(t)) => match timestamp_to_chrono(t) {
-                    Some(renew_chrono) => {
-                        let deadline = renew_chrono + chrono::Duration::seconds(lease_dur as i64);
-                        now > deadline
-                    }
-                    None => {
-                        warn!(
-                            lease = name,
-                            "lease has unrepresentable renew timestamp, treating as expired"
-                        );
-                        true
-                    }
-                },
-                None => true,
-            };
+            // No holder (or empty string) means a previous leader stepped
+            // down cooperatively — take over immediately without waiting
+            // for TTL. Otherwise, the lease is up for grabs only if the
+            // last renewal is older than `lease_duration_seconds`.
+            let unowned = holder.map(str::is_empty).unwrap_or(true);
+            let expired = !unowned
+                && match renew_time {
+                    Some(MicroTime(t)) => match timestamp_to_chrono(t) {
+                        Some(renew_chrono) => {
+                            let deadline =
+                                renew_chrono + chrono::Duration::seconds(lease_dur as i64);
+                            now > deadline
+                        }
+                        None => {
+                            warn!(
+                                lease = name,
+                                "lease has unrepresentable renew timestamp, treating as expired"
+                            );
+                            true
+                        }
+                    },
+                    None => true,
+                };
 
-            if expired {
+            if unowned || expired {
                 let transitions = spec.and_then(|s| s.lease_transitions).unwrap_or(0) + 1;
                 let spec = existing.spec.get_or_insert_with(Default::default);
                 spec.holder_identity = Some(identity.to_string());
@@ -493,7 +500,7 @@ async fn clear_holder(leases: &Api<Lease>, name: &str, identity: &str) -> Result
     // Leave renew_time at its last value so the new leader can compute
     // expiry normally; the absence of `holder_identity` is sufficient
     // signal for immediate takeover.
-    let _ = replace_lease(leases, name, existing).await?;
+    replace_lease(leases, name, existing).await?;
     Ok(())
 }
 
@@ -771,6 +778,58 @@ mod tests {
             try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION)
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn try_acquire_takes_over_when_holder_cleared() {
+        // Cooperative step-down leaves renew_time fresh but clears
+        // holder_identity. Next replica must take over immediately
+        // without waiting for TTL — the whole point of step_down.
+        let server = MockServer::start().await;
+        let now_iso = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": {"name": "my-lease", "namespace": "test-ns"},
+                "spec": {
+                    "holderIdentity": null,
+                    "leaseDurationSeconds": 15,
+                    "leaseTransitions": 7,
+                    "renewTime": now_iso
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": {"name": "my-lease", "namespace": "test-ns"},
+                "spec": {
+                    "holderIdentity": "me",
+                    "leaseDurationSeconds": 15,
+                    "leaseTransitions": 8
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server);
+        let leases: Api<Lease> = Api::namespaced(client, "test-ns");
+        assert!(
+            try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION)
+                .await
+                .unwrap(),
+            "must take over a lease whose holder_identity has been cleared"
         );
     }
 
