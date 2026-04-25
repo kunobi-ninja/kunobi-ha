@@ -460,12 +460,24 @@ async fn replace_lease(leases: &Api<Lease>, name: &str, lease: Lease) -> Result<
     }
 }
 
+/// Outcome of a renewal attempt. Distinct from a generic `bool` so that
+/// the renew loop can tell "we definitely lost the lease" (Lost) apart
+/// from a transient API error (Err), which it must retry within
+/// `renew_deadline` rather than treat as a stepdown.
+#[derive(Debug, PartialEq, Eq)]
+enum RenewOutcome {
+    /// The renewal PUT succeeded.
+    Renewed,
+    /// Another instance now holds the lease — we have lost it.
+    Lost,
+}
+
 async fn renew_lease(
     leases: &Api<Lease>,
     name: &str,
     identity: &str,
     lease_secs: i32,
-) -> Result<bool> {
+) -> Result<RenewOutcome> {
     let existing = leases.get(name).await?;
     let holder = existing
         .spec
@@ -478,9 +490,20 @@ async fn renew_lease(
             identity = identity,
             "leader lease is held by another instance"
         );
-        return Ok(false);
+        return Ok(RenewOutcome::Lost);
     }
-    renew_existing_lease(leases, name, existing, identity, lease_secs).await
+    // PUT directly rather than going through `replace_lease`, which
+    // collapses 409 into `Ok(false)`. For renewal we want 409 to
+    // surface as `Err` so the renew loop retries within `renew_deadline`
+    // instead of stepping down on a single optimistic-concurrency miss.
+    let mut lease = existing;
+    let now = MicroTime(chrono_to_timestamp(chrono::Utc::now())?);
+    let spec = lease.spec.get_or_insert_with(Default::default);
+    spec.holder_identity = Some(identity.to_string());
+    spec.lease_duration_seconds = Some(lease_secs);
+    spec.renew_time = Some(now);
+    leases.replace(name, &PostParams::default(), &lease).await?;
+    Ok(RenewOutcome::Renewed)
 }
 
 /// Clear the holder when we're the current holder. Used by cooperative
@@ -533,10 +556,10 @@ async fn renew_loop(
         )
         .await
         {
-            Ok(Ok(true)) => {
+            Ok(Ok(RenewOutcome::Renewed)) => {
                 last_renew = tokio::time::Instant::now();
             }
-            Ok(Ok(false)) => {
+            Ok(Ok(RenewOutcome::Lost)) => {
                 warn!("lost leader lease — stepping down");
                 let _ = tx.send(false);
                 return;
@@ -863,6 +886,71 @@ mod tests {
             !try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION)
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn renew_lease_returns_lost_when_holder_changed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": {"name": "my-lease", "namespace": "test-ns"},
+                "spec": {"holderIdentity": "other", "leaseDurationSeconds": 15}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server);
+        let leases: Api<Lease> = Api::namespaced(client, "test-ns");
+        assert_eq!(
+            renew_lease(&leases, "my-lease", "me", 15).await.unwrap(),
+            RenewOutcome::Lost,
+        );
+    }
+
+    #[tokio::test]
+    async fn renew_lease_propagates_put_409_as_err() {
+        // 409 on PUT during renewal must surface as an error so the
+        // renew loop retries within `renew_deadline`. Treating it as
+        // `Lost` would step the leader down on a single transient
+        // optimistic-concurrency miss.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": {"name": "my-lease", "namespace": "test-ns"},
+                "spec": {"holderIdentity": "me", "leaseDurationSeconds": 15}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure", "code": 409,
+                "reason": "Conflict", "message": "the object has been modified"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server);
+        let leases: Api<Lease> = Api::namespaced(client, "test-ns");
+        let err = renew_lease(&leases, "my-lease", "me", 15)
+            .await
+            .expect_err("409 must be Err, not Ok(Lost)");
+        assert!(
+            matches!(err, Error::Kube(_)),
+            "expected kube api error, got {err:?}"
         );
     }
 
