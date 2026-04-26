@@ -744,8 +744,254 @@ mod tests {
         assert!(matches!(err, Error::InvalidConfig(_)), "got {err:?}");
     }
 
+    #[tokio::test]
+    async fn validate_rejects_renew_equals_lease_exact_boundary() {
+        // Pin the `>=` boundary: equality is rejected, not just `>`. Without
+        // this case, a mutant flipping `>=` to `>` would survive.
+        let server = MockServer::start().await;
+        let le = election_with(
+            mock_client(&server),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            Duration::from_secs(1),
+        );
+        assert!(le.validate().is_err(), "renew == lease must reject");
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_retry_equals_renew_exact_boundary() {
+        // Pin the `>` boundary: retry == renew is allowed (only `>` rejects).
+        // Without this case, a mutant flipping `>` to `>=` would survive.
+        let server = MockServer::start().await;
+        let le = election_with(
+            mock_client(&server),
+            Duration::from_secs(15),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        );
+        assert!(le.validate().is_ok(), "retry == renew must be allowed");
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_default_config() {
+        // Defaults must always validate, otherwise the docs lie.
+        let server = MockServer::start().await;
+        let le = LeaderElection::builder(mock_client(&server), "ns", "lease")
+            .identity("me")
+            .build();
+        assert!(le.validate().is_ok());
+    }
+
     // -----------------------------------------------------------------------
     // try_acquire / renew_lease against a mocked Kubernetes API
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn try_acquire_propagates_get_500_as_err() {
+        // Differentiates the `ae.code == 404` match guard from `true`:
+        // a 5xx must propagate, not be silently treated as "lease absent".
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure", "code": 500,
+                "reason": "InternalError"
+            })))
+            .mount(&server)
+            .await;
+
+        let leases: Api<Lease> =
+            Api::namespaced(mock_client(&server), "test-ns");
+        let err = try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION)
+            .await
+            .err()
+            .expect("500 must surface as Err, not Ok(false)");
+        assert!(matches!(err, Error::Kube(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn try_acquire_propagates_post_500_as_err() {
+        // GET returns 404 (no lease) so we attempt POST. A 5xx on POST
+        // must propagate, not be silently treated as "another instance
+        // beat us" (which is what 409 means).
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure", "code": 404,
+                "reason": "NotFound"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases",
+            ))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure", "code": 500,
+                "reason": "InternalError"
+            })))
+            .mount(&server)
+            .await;
+
+        let leases: Api<Lease> =
+            Api::namespaced(mock_client(&server), "test-ns");
+        let err = try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION)
+            .await
+            .err()
+            .expect("POST 500 must surface as Err");
+        assert!(matches!(err, Error::Kube(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn try_acquire_propagates_put_500_as_err() {
+        // GET shows we are the holder, so try_acquire calls
+        // `renew_existing_lease` -> `replace_lease` (PUT). A 5xx on PUT
+        // must propagate, not be silently treated as 409 (conflict).
+        let server = MockServer::start().await;
+        let now_iso = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": {"name": "my-lease", "namespace": "test-ns"},
+                "spec": {
+                    "holderIdentity": "me",
+                    "leaseDurationSeconds": 15,
+                    "renewTime": now_iso
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure", "code": 500,
+                "reason": "InternalError"
+            })))
+            .mount(&server)
+            .await;
+
+        let leases: Api<Lease> =
+            Api::namespaced(mock_client(&server), "test-ns");
+        let err = try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION)
+            .await
+            .err()
+            .expect("PUT 500 must surface as Err");
+        assert!(matches!(err, Error::Kube(_)), "got {err:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // LeaderGuard public API
+    // -----------------------------------------------------------------------
+
+    fn lease_held_by(identity: &str) -> serde_json::Value {
+        let now_iso = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {"name": "my-lease", "namespace": "test-ns"},
+            "spec": {
+                "holderIdentity": identity,
+                "leaseDurationSeconds": 15,
+                "renewTime": now_iso,
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn guard_step_down_completes_full_lifecycle() {
+        // Acquire -> is_leader true -> step_down. Verifies the public
+        // entry points (`acquire`, `is_leader`, `step_down`,
+        // `step_down_inner`, `Drop`) all run real work; mutants that
+        // replace any of them with `()` would let the test pass only by
+        // accident, and these assertions catch the most obvious cases.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_held_by("me")))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_held_by("me")))
+            .mount(&server)
+            .await;
+
+        let leader = LeaderElection::builder(mock_client(&server), "test-ns", "my-lease")
+            .identity("me")
+            .build();
+        let guard = leader.acquire().await.expect("acquire must succeed");
+        assert!(guard.is_leader(), "is_leader must be true post-acquire");
+        guard.step_down().await;
+    }
+
+    #[tokio::test]
+    async fn guard_lost_fires_when_renew_observes_other_holder() {
+        // Acquire -> renew loop sees a different holder -> renew_lease
+        // returns Lost -> tx.send(false) -> guard.lost() resolves and
+        // is_leader flips to false. Exercises the renew-loop deadline
+        // and `lost`/`is_leader` mutants that the all-`true` returns
+        // would let pass.
+        let server = MockServer::start().await;
+        // Initial GET: held by us — try_acquire goes through the
+        // own-renew path successfully.
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_held_by("me")))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Subsequent GETs: held by someone else — renew sees Lost.
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_held_by("other")))
+            .mount(&server)
+            .await;
+        // PUT (initial own-renew): success.
+        Mock::given(method("PUT"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_held_by("me")))
+            .mount(&server)
+            .await;
+
+        let leader = LeaderElection::builder(mock_client(&server), "test-ns", "my-lease")
+            .identity("me")
+            .lease_duration(Duration::from_millis(200))
+            .renew_deadline(Duration::from_millis(100))
+            .retry_period(Duration::from_millis(20))
+            .renew_request_timeout(Duration::from_millis(50))
+            .build();
+        let mut guard = leader.acquire().await.expect("acquire must succeed");
+        assert!(guard.is_leader(), "must be leader post-acquire");
+
+        tokio::time::timeout(Duration::from_secs(2), guard.lost())
+            .await
+            .expect("lost() must fire when renew sees a different holder");
+        assert!(!guard.is_leader(), "is_leader must be false post-stepdown");
+    }
+
+    // -----------------------------------------------------------------------
+    // Original try_acquire wiremock tests (kept verbatim)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
