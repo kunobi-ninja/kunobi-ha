@@ -15,13 +15,16 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
   RUSTDOCFLAGS: -D warnings
+  # Silence the Node 20 deprecation warning emitted by actions/checkout
+  # and actions/cache. Node 24 becomes the default in June 2026.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   checks:
     name: Rust Checks
     runs-on: kunobi-runners
     container:
-      image: rust:1.93-bookworm
+      image: rust:1.94.1-bookworm
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -29,9 +32,9 @@ jobs:
       - name: Cache cargo
         uses: actions/cache@v4
         with:
-          # `~/.cargo/bin` caches `cargo-audit` / `cargo-outdated` so
-          # we don't recompile them on every run. Splitting registry
-          # into index/cache (skipping `src`) keeps the cache smaller.
+          # `~/.cargo/bin` caches installed tools so cargo-deny doesn't
+          # recompile every run. Splitting registry into index/cache
+          # (skipping `src`) keeps the cache smaller.
           path: |
             ~/.cargo/bin
             ~/.cargo/registry/index
@@ -60,6 +63,9 @@ jobs:
       - name: Build lib (latest)
         run: cargo build --lib --features latest
 
+      - name: Build examples
+        run: cargo build --examples
+
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
@@ -69,16 +75,32 @@ jobs:
       - name: Build docs
         run: cargo doc --lib --no-deps --features latest
 
-      - name: Security audit
+  # cargo-deny replaces cargo-audit + cargo-outdated. It checks RustSec
+  # advisories, license policy, banned crates, and duplicate versions in
+  # one pass — generally faster and better maintained than running the
+  # two tools separately.
+  deny:
+    name: cargo-deny
+    runs-on: kunobi-runners
+    container:
+      image: rust:1.94.1-bookworm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-deny-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'deny.toml') }}
+          restore-keys: cargo-deny-${{ runner.os }}-
+      - name: Install cargo-deny
         run: |
-          if ! command -v cargo-audit >/dev/null; then
-            cargo install cargo-audit --locked
+          if ! command -v cargo-deny >/dev/null; then
+            cargo install cargo-deny --locked
           fi
-          cargo audit
-
-      - name: Check outdated dependencies
-        run: |
-          if ! command -v cargo-outdated >/dev/null; then
-            cargo install cargo-outdated --locked
-          fi
-          cargo outdated --exit-code 1 --depth 1 || echo "::warning::Some direct dependencies are outdated"
+      - name: cargo deny check
+        run: cargo deny check
