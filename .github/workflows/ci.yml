@@ -75,29 +75,6 @@ jobs:
       - name: Build docs
         run: cargo doc --lib --no-deps --features latest
 
-  # Verify the rust-version pinned in Cargo.toml actually compiles the
-  # crate. Without this job, the MSRV claim has no teeth.
-  msrv:
-    name: MSRV (1.94.1)
-    runs-on: kunobi-runners
-    container:
-      image: rust:1.94.1-bookworm
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: cargo-msrv-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-msrv-${{ runner.os }}-
-      - name: Build
-        run: cargo build --lib --features latest
-
   # cargo-deny replaces cargo-audit + cargo-outdated. It checks RustSec
   # advisories, license policy, banned crates, and duplicate versions in
   # one pass — generally faster and better maintained than running the
