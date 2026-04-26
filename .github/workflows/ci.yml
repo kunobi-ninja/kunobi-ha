@@ -78,10 +78,10 @@ jobs:
   # Verify the rust-version pinned in Cargo.toml actually compiles the
   # crate. Without this job, the MSRV claim has no teeth.
   msrv:
-    name: MSRV (1.85)
+    name: MSRV (1.88)
     runs-on: kunobi-runners
     container:
-      image: rust:1.85-bookworm
+      image: rust:1.88-bookworm
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
