@@ -805,8 +805,7 @@ mod tests {
         let leases: Api<Lease> = Api::namespaced(mock_client(&server), "test-ns");
         let err = try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION)
             .await
-            .err()
-            .expect("500 must surface as Err, not Ok(false)");
+            .expect_err("500 must surface as Err, not Ok(false)");
         assert!(matches!(err, Error::Kube(_)), "got {err:?}");
     }
 
@@ -840,8 +839,7 @@ mod tests {
         let leases: Api<Lease> = Api::namespaced(mock_client(&server), "test-ns");
         let err = try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION)
             .await
-            .err()
-            .expect("POST 500 must surface as Err");
+            .expect_err("POST 500 must surface as Err");
         assert!(matches!(err, Error::Kube(_)), "got {err:?}");
     }
 
@@ -882,8 +880,7 @@ mod tests {
         let leases: Api<Lease> = Api::namespaced(mock_client(&server), "test-ns");
         let err = try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION)
             .await
-            .err()
-            .expect("PUT 500 must surface as Err");
+            .expect_err("PUT 500 must surface as Err");
         assert!(matches!(err, Error::Kube(_)), "got {err:?}");
     }
 
