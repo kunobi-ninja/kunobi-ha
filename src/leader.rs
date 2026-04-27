@@ -393,6 +393,20 @@ fn timestamp_to_chrono(ts: &k8s_openapi::jiff::Timestamp) -> Option<chrono::Date
     chrono::DateTime::from_timestamp(ts.as_second(), 0)
 }
 
+/// Pure helper: has the lease passed its TTL relative to its last
+/// renewal? Used by `try_acquire` to decide whether a lease held by
+/// someone else is up for grabs.
+///
+/// Pulled out so the boundary (`>`, not `>=`) can be exercised
+/// exhaustively without depending on real-clock timing.
+fn chrono_lease_expired(
+    now: chrono::DateTime<chrono::Utc>,
+    renew_time: chrono::DateTime<chrono::Utc>,
+    lease_duration: chrono::Duration,
+) -> bool {
+    now > renew_time + lease_duration
+}
+
 async fn try_acquire(
     leases: &Api<Lease>,
     name: &str,
@@ -424,11 +438,11 @@ async fn try_acquire(
             let expired = !unowned
                 && match renew_time {
                     Some(MicroTime(t)) => match timestamp_to_chrono(t) {
-                        Some(renew_chrono) => {
-                            let deadline =
-                                renew_chrono + chrono::Duration::seconds(lease_dur as i64);
-                            now > deadline
-                        }
+                        Some(renew_chrono) => chrono_lease_expired(
+                            now,
+                            renew_chrono,
+                            chrono::Duration::seconds(lease_dur as i64),
+                        ),
                         None => {
                             warn!(
                                 lease = name,
@@ -678,6 +692,45 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // chrono_lease_expired boundary
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn chrono_lease_expired_strict_at_boundary() {
+        // Exactly at the deadline: NOT expired (the condition is `>`,
+        // not `>=`). A `>=` mutant would let two replicas race to
+        // claim a lease at the exact instant of expiry.
+        let renew = chrono::DateTime::from_timestamp(1_000_000, 0).unwrap();
+        let lease = chrono::Duration::seconds(15);
+        let now = renew + lease;
+        assert!(!chrono_lease_expired(now, renew, lease));
+    }
+
+    #[test]
+    fn chrono_lease_expired_one_second_past() {
+        let renew = chrono::DateTime::from_timestamp(1_000_000, 0).unwrap();
+        let lease = chrono::Duration::seconds(15);
+        let now = renew + lease + chrono::Duration::seconds(1);
+        assert!(chrono_lease_expired(now, renew, lease));
+    }
+
+    #[test]
+    fn chrono_lease_expired_well_before() {
+        let renew = chrono::DateTime::from_timestamp(1_000_000, 0).unwrap();
+        let lease = chrono::Duration::seconds(15);
+        let now = renew + chrono::Duration::seconds(1);
+        assert!(!chrono_lease_expired(now, renew, lease));
+    }
+
+    #[test]
+    fn chrono_lease_expired_well_after() {
+        let renew = chrono::DateTime::from_timestamp(1_000_000, 0).unwrap();
+        let lease = chrono::Duration::seconds(15);
+        let now = renew + chrono::Duration::seconds(60);
+        assert!(chrono_lease_expired(now, renew, lease));
+    }
+
+    // -----------------------------------------------------------------------
     // renew_deadline_exceeded boundary
     // -----------------------------------------------------------------------
 
@@ -835,6 +888,55 @@ mod tests {
         assert!(le.validate().is_ok());
     }
 
+    #[tokio::test]
+    async fn acquire_observe_timeout_waits_for_full_window() {
+        // Persistent 5xx from the API. `acquire` must return
+        // `ObserveTimeout` only AFTER ~observe_timeout has elapsed —
+        // not on the first error. Catches:
+        //   - `+ with -` mutant on `now + observe_timeout`: deadline
+        //     ends up in the past, ObserveTimeout fires immediately.
+        //   - `>= with <` mutant on `now >= *deadline`: condition
+        //     starts true (now < now + observe_timeout), so
+        //     ObserveTimeout fires on the first error.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure", "code": 500,
+                "reason": "InternalError"
+            })))
+            .mount(&server)
+            .await;
+
+        let leader = LeaderElection::builder(mock_client(&server), "test-ns", "my-lease")
+            .identity("me")
+            .lease_duration(Duration::from_millis(100))
+            .renew_deadline(Duration::from_millis(50))
+            .retry_period(Duration::from_millis(10))
+            .observe_timeout(Duration::from_millis(150))
+            .build();
+
+        let start = tokio::time::Instant::now();
+        let result = leader.acquire().await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "must error after sustained 5xx");
+        assert!(
+            matches!(result.as_ref().err().unwrap(), Error::ObserveTimeout(_, _)),
+            "got {:?}",
+            result.err()
+        );
+        // Original elapsed: ~observe_timeout (150ms+). Mutants fire
+        // on first error (~10-50ms). 100ms threshold is well-below
+        // the original and well-above any mutant's fast-bail.
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "ObserveTimeout returned too early ({elapsed:?}) — must wait near observe_timeout"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // try_acquire / renew_lease against a mocked Kubernetes API
     // -----------------------------------------------------------------------
@@ -984,6 +1086,34 @@ mod tests {
         let guard = leader.acquire().await.expect("acquire must succeed");
         assert!(guard.is_leader(), "is_leader must be true post-acquire");
         guard.step_down().await;
+
+        // step_down's contract is to send a PUT that clears
+        // holder_identity so the next replica takes over without
+        // waiting for TTL. Verify the mock observed at least one PUT
+        // whose body lacks a `holderIdentity` field — k8s-openapi
+        // serialises `Option::None` by omitting the field. Without
+        // this assertion, mutants replacing `step_down` /
+        // `step_down_inner` / `Drop` with `()` survive.
+        let cleared = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.method.as_str() == "PUT")
+            .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+            .any(|v| {
+                v.get("spec")
+                    .and_then(|s| s.as_object())
+                    .map(|obj| {
+                        let h = obj.get("holderIdentity");
+                        h.is_none() || h.is_some_and(serde_json::Value::is_null)
+                    })
+                    .unwrap_or(false)
+            });
+        assert!(
+            cleared,
+            "step_down must send a PUT with cleared holder_identity"
+        );
     }
 
     #[tokio::test]
