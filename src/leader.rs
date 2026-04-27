@@ -778,6 +778,94 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Property-based invariants for the pure helpers
+    // -----------------------------------------------------------------------
+    //
+    // proptest generates 256 random inputs per !prop and shrinks failing
+    // cases to a minimal counter-example. This catches off-by-one and
+    // overflow bugs that example-based tests miss because we'd never
+    // think to enumerate them.
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// `chrono_lease_expired` is `now > renew_time + lease_duration`.
+        /// Encoded as the contract: equality at the deadline is NOT
+        /// expired; one nanosecond past IS expired; arbitrary slack on
+        /// either side preserves the result.
+        #[test]
+        fn prop_chrono_lease_expired_matches_definition(
+            renew_seconds in 0_i64..2_000_000_000,
+            lease_seconds in 1_i64..3600,
+            slack_nanos in -10_000_000_000_i64..10_000_000_000,
+        ) {
+            let renew = chrono::DateTime::from_timestamp(renew_seconds, 0).unwrap();
+            let lease = chrono::Duration::seconds(lease_seconds);
+            let deadline = renew + lease;
+            let now = deadline + chrono::Duration::nanoseconds(slack_nanos);
+
+            let expected = slack_nanos > 0;
+            prop_assert_eq!(chrono_lease_expired(now, renew, lease), expected);
+        }
+
+        /// At exact equality, `renew_deadline_exceeded` is false (the
+        /// `>` boundary). Above by any amount, true. Below, false.
+        #[test]
+        fn prop_renew_deadline_exceeded_matches_definition(
+            renew_secs in 1_u64..3600,
+            slack_nanos in -10_000_000_000_i64..10_000_000_000,
+        ) {
+            let last = tokio::time::Instant::now();
+            let renew = Duration::from_secs(renew_secs);
+            let baseline = last + renew;
+            let now = if slack_nanos >= 0 {
+                baseline + Duration::from_nanos(slack_nanos as u64)
+            } else {
+                baseline - Duration::from_nanos((-slack_nanos) as u64)
+            };
+
+            let expected = slack_nanos > 0;
+            prop_assert_eq!(renew_deadline_exceeded(now, last, renew), expected);
+        }
+
+        /// `validate` accepts iff every documented invariant holds:
+        ///   renew_deadline < lease_duration
+        ///   retry_period <= renew_deadline
+        ///   retry_period > 0
+        ///   identity / name / namespace non-empty
+        /// Generates random duration tuples and asserts validate's verdict
+        /// matches a hand-coded predicate.
+        #[test]
+        fn prop_validate_matches_documented_constraints(
+            lease_ms in 1_u64..60_000,
+            renew_ms in 0_u64..60_000,
+            retry_ms in 0_u64..60_000,
+        ) {
+            let lease = Duration::from_millis(lease_ms);
+            let renew = Duration::from_millis(renew_ms);
+            let retry = Duration::from_millis(retry_ms);
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(async {
+                let server = MockServer::start().await;
+                let le = LeaderElection::builder(mock_client(&server), "ns", "lease")
+                    .identity("me")
+                    .lease_duration(lease)
+                    .renew_deadline(renew)
+                    .retry_period(retry)
+                    .build();
+                le.validate()
+            });
+
+            let valid = renew < lease && retry <= renew && !retry.is_zero();
+            prop_assert_eq!(result.is_ok(), valid);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Wiremock-based integration tests
     // -----------------------------------------------------------------------
 

@@ -57,6 +57,10 @@ serde_json = "1"
 http = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Property-based tests for the pure timing helpers. Generates 256
+# random inputs per invariant; cheaper than enumerating the entire
+# space and catches off-by-one bugs that example-based tests miss.
+proptest = "1"
 # Pick a k8s-openapi version so our own tests can build. Binary consumers
 # of kunobi-ha must activate their own `v1_xx` feature instead.
 k8s-openapi = { version = "0.27", features = ["latest"] }
