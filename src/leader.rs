@@ -802,8 +802,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let leases: Api<Lease> =
-            Api::namespaced(mock_client(&server), "test-ns");
+        let leases: Api<Lease> = Api::namespaced(mock_client(&server), "test-ns");
         let err = try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION)
             .await
             .err()
@@ -838,8 +837,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let leases: Api<Lease> =
-            Api::namespaced(mock_client(&server), "test-ns");
+        let leases: Api<Lease> = Api::namespaced(mock_client(&server), "test-ns");
         let err = try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION)
             .await
             .err()
@@ -881,8 +879,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let leases: Api<Lease> =
-            Api::namespaced(mock_client(&server), "test-ns");
+        let leases: Api<Lease> = Api::namespaced(mock_client(&server), "test-ns");
         let err = try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION)
             .await
             .err()
