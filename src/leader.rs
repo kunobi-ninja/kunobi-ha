@@ -961,7 +961,20 @@ mod tests {
         let err = try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION)
             .await
             .expect_err("500 must surface as Err, not Ok(false)");
-        assert!(matches!(err, Error::Kube(_)), "got {err:?}");
+        // Pin the specific upstream status code. Without this, a mutant
+        // flipping the `ae.code == 404` match guard to `true` (which
+        // would route a 500 GET error through the create path → POST →
+        // wiremock default 404 → Err(Api(404))) survives because both
+        // original and mutant are still `Error::Kube(_)`.
+        match err {
+            Error::Kube(kube::Error::Api(ae)) => {
+                assert_eq!(
+                    ae.code, 500,
+                    "must propagate the original 500, not a downstream 404"
+                );
+            }
+            other => panic!("expected kube Api error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1113,6 +1126,66 @@ mod tests {
         assert!(
             cleared,
             "step_down must send a PUT with cleared holder_identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_drop_aborts_renew_task() {
+        // Verifies that dropping the guard stops the renew loop. Without
+        // this, a mutant replacing `<impl Drop for LeaderGuard>::drop`
+        // with `()` survives — the renew task would keep PUTting in the
+        // background indefinitely.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_held_by("me")))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_held_by("me")))
+            .mount(&server)
+            .await;
+
+        let leader = LeaderElection::builder(mock_client(&server), "test-ns", "my-lease")
+            .identity("me")
+            .lease_duration(Duration::from_millis(200))
+            .renew_deadline(Duration::from_millis(100))
+            .retry_period(Duration::from_millis(20))
+            .build();
+
+        let guard = leader.acquire().await.expect("acquire must succeed");
+        // Let the renew loop's first tick complete so `baseline` is
+        // stable.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let count_puts = || async {
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r.method.as_str() == "PUT")
+                .count()
+        };
+
+        let baseline = count_puts().await;
+        drop(guard);
+
+        // Wait several retry_periods. Original Drop: handle.abort()
+        // halts the loop, so no new PUTs. Mutant Drop -> (): the loop
+        // keeps ticking and we'd see retry_period-pace PUTs continuing.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let after = count_puts().await;
+
+        assert!(
+            after.saturating_sub(baseline) <= 1,
+            "Drop must abort the renew task; observed {} extra PUTs in 200ms after drop",
+            after.saturating_sub(baseline)
         );
     }
 
