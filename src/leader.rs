@@ -614,7 +614,8 @@ async fn renew_loop(
             }
             Ok(Err(e)) => {
                 warn!(%e, "failed to renew leader lease");
-                if tokio::time::Instant::now().duration_since(last_renew) > renew_deadline {
+                if renew_deadline_exceeded(tokio::time::Instant::now(), last_renew, renew_deadline)
+                {
                     warn!(
                         "renew deadline exceeded — stepping down after {:?} since last success",
                         renew_deadline
@@ -625,7 +626,8 @@ async fn renew_loop(
             }
             Err(_) => {
                 warn!("timed out renewing leader lease");
-                if tokio::time::Instant::now().duration_since(last_renew) > renew_deadline {
+                if renew_deadline_exceeded(tokio::time::Instant::now(), last_renew, renew_deadline)
+                {
                     warn!(
                         "renew deadline exceeded — stepping down after {:?} since last success",
                         renew_deadline
@@ -638,6 +640,18 @@ async fn renew_loop(
     }
 }
 
+/// Pure helper: has the leader missed its renew window?
+///
+/// Pulled out of `renew_loop` so the boundary (`>`, not `>=`) can be
+/// exercised exhaustively without depending on real tokio time.
+fn renew_deadline_exceeded(
+    now: tokio::time::Instant,
+    last_renew: tokio::time::Instant,
+    renew_deadline: Duration,
+) -> bool {
+    now.duration_since(last_renew) > renew_deadline
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -645,7 +659,7 @@ async fn renew_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // -----------------------------------------------------------------------
@@ -661,6 +675,45 @@ mod tests {
     fn chrono_to_timestamp_epoch_ok() {
         let epoch = chrono::DateTime::from_timestamp(0, 0).unwrap();
         assert_eq!(chrono_to_timestamp(epoch).unwrap().as_second(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // renew_deadline_exceeded boundary
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn renew_deadline_exceeded_strict_at_boundary() {
+        // Exactly equal to renew_deadline: must NOT be considered
+        // exceeded (the condition is `>`, not `>=`).
+        let last = tokio::time::Instant::now();
+        let renew_deadline = Duration::from_secs(10);
+        let now = last + renew_deadline;
+        assert!(!renew_deadline_exceeded(now, last, renew_deadline));
+    }
+
+    #[tokio::test]
+    async fn renew_deadline_exceeded_just_past_boundary() {
+        // One nanosecond past: exceeded.
+        let last = tokio::time::Instant::now();
+        let renew_deadline = Duration::from_secs(10);
+        let now = last + renew_deadline + Duration::from_nanos(1);
+        assert!(renew_deadline_exceeded(now, last, renew_deadline));
+    }
+
+    #[tokio::test]
+    async fn renew_deadline_exceeded_well_below() {
+        let last = tokio::time::Instant::now();
+        let renew_deadline = Duration::from_secs(10);
+        let now = last + Duration::from_secs(1);
+        assert!(!renew_deadline_exceeded(now, last, renew_deadline));
+    }
+
+    #[tokio::test]
+    async fn renew_deadline_exceeded_well_above() {
+        let last = tokio::time::Instant::now();
+        let renew_deadline = Duration::from_secs(10);
+        let now = last + Duration::from_secs(60);
+        assert!(renew_deadline_exceeded(now, last, renew_deadline));
     }
 
     #[test]
@@ -1001,10 +1054,26 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        // Body matchers below pin every static field of the create
+        // payload. If any field is dropped from the LeaseSpec / metadata
+        // struct expression, body_partial_json fails to match and the
+        // mock silently 404s — try_acquire returns Err, the test fails.
+        // body_string_contains covers the dynamic timestamp fields
+        // (acquireTime / renewTime) by checking for the key presence.
         Mock::given(method("POST"))
             .and(path(
                 "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases",
             ))
+            .and(body_partial_json(serde_json::json!({
+                "metadata": {"name": "my-lease"},
+                "spec": {
+                    "holderIdentity": "me",
+                    "leaseDurationSeconds": 15,
+                    "leaseTransitions": 0
+                }
+            })))
+            .and(body_string_contains("acquireTime"))
+            .and(body_string_contains("renewTime"))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
                 "apiVersion": "coordination.k8s.io/v1",
                 "kind": "Lease",
@@ -1118,10 +1187,22 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        // Pin every static field of the takeover PUT. lease_transitions
+        // bumps from 3 (existing) to 4. Dynamic timestamps are checked
+        // by key presence.
         Mock::given(method("PUT"))
             .and(path(
                 "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
             ))
+            .and(body_partial_json(serde_json::json!({
+                "spec": {
+                    "holderIdentity": "me",
+                    "leaseDurationSeconds": 15,
+                    "leaseTransitions": 4
+                }
+            })))
+            .and(body_string_contains("acquireTime"))
+            .and(body_string_contains("renewTime"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "coordination.k8s.io/v1",
                 "kind": "Lease",
@@ -1193,6 +1274,54 @@ mod tests {
                 .await
                 .unwrap(),
             "must take over a lease whose holder_identity has been cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_acquire_returns_false_on_replace_409_during_takeover() {
+        // Pre-existing expired lease held by "other"; we attempt a PUT
+        // takeover which 409s (another replica beat us). `replace_lease`
+        // must collapse the 409 into Ok(false) so the acquire loop can
+        // retry on the next tick. Without this test, a mutant flipping
+        // `match guard ae.code == 409` to `false` (which would make 409
+        // fall through to `Err(e.into())`) survives.
+        let server = MockServer::start().await;
+        let long_ago = (chrono::Utc::now() - chrono::Duration::seconds(60))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": {"name": "my-lease", "namespace": "test-ns"},
+                "spec": {
+                    "holderIdentity": "other",
+                    "leaseDurationSeconds": 15,
+                    "renewTime": long_ago
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure", "code": 409,
+                "reason": "Conflict"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server);
+        let leases: Api<Lease> = Api::namespaced(client, "test-ns");
+        assert!(
+            !try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION)
+                .await
+                .unwrap(),
+            "409 on takeover PUT must yield Ok(false), not Err"
         );
     }
 
