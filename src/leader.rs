@@ -8,7 +8,7 @@
 //!
 //! ```no_run
 //! # async fn example(client: kube::Client) -> kunobi_ha::Result<()> {
-//! use kunobi_ha::leader::LeaderElection;
+//! use kunobi_ha::leader::{LeaderElection, StepDownReason};
 //! use std::time::Duration;
 //!
 //! let leader = LeaderElection::builder(client, "karakuri-system", "karakuri-operator")
@@ -23,8 +23,13 @@
 //! // Start controllers here, watching `guard.lost()` for step-down.
 //! loop {
 //!     tokio::select! {
-//!         _ = guard.lost() => {
-//!             // Lost leadership (renewal failed past `renew_deadline`).
+//!         reason = guard.lost() => {
+//!             match reason {
+//!                 StepDownReason::RenewDeadlineExceeded => {} // API down
+//!                 StepDownReason::HolderChanged => {}         // usurped
+//!                 StepDownReason::Cancelled => {}             // self-driven
+//!                 _ => {}                                     // future variants
+//!             }
 //!             break;
 //!         }
 //!         // ... your controller futures ...
@@ -63,7 +68,7 @@ use kube::api::{Api, ObjectMeta, PostParams};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::error::{Error, Result};
+use crate::error::{Error, InvalidConfig, Result};
 
 // ---------------------------------------------------------------------------
 // Defaults (Kubernetes reference values)
@@ -79,7 +84,63 @@ const DEFAULT_RENEW_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 // Builder
 // ---------------------------------------------------------------------------
 
+/// How an instance identifies itself in the Lease's `holder_identity`
+/// field.
+///
+/// Two replicas competing for the same Lease must have distinct
+/// identities; otherwise either one will be treated as renewing the
+/// other's hold.
+///
+/// The default ([`Identity::PodNameOrUuid`]) is the right choice in
+/// Kubernetes — `$HOSTNAME` is the pod name, which is unique within
+/// the cluster.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum Identity {
+    /// Use `$HOSTNAME`. Falls back to a fresh UUID if the variable is
+    /// unset, empty, or unreadable. Recommended default in
+    /// Kubernetes.
+    PodNameOrUuid,
+    /// Always generate a fresh UUID, ignoring `$HOSTNAME`. Useful for
+    /// non-Kubernetes uses or when the host name is not unique.
+    Generated,
+    /// Use this exact string. The caller is responsible for uniqueness.
+    Custom(String),
+}
+
+impl Default for Identity {
+    fn default() -> Self {
+        Self::PodNameOrUuid
+    }
+}
+
+impl Identity {
+    fn resolve(self) -> String {
+        match self {
+            Identity::PodNameOrUuid => std::env::var("HOSTNAME")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            Identity::Generated => uuid::Uuid::new_v4().to_string(),
+            Identity::Custom(s) => s,
+        }
+    }
+}
+
+impl From<&str> for Identity {
+    fn from(s: &str) -> Self {
+        Identity::Custom(s.to_string())
+    }
+}
+
+impl From<String> for Identity {
+    fn from(s: String) -> Self {
+        Identity::Custom(s)
+    }
+}
+
 /// Configure and start a leader election loop.
+#[non_exhaustive]
 pub struct LeaderElection {
     client: Client,
     namespace: String,
@@ -93,11 +154,12 @@ pub struct LeaderElection {
 }
 
 /// Fluent builder returned by [`LeaderElection::builder`].
+#[non_exhaustive]
 pub struct LeaderElectionBuilder {
     client: Client,
     namespace: String,
     name: String,
-    identity: Option<String>,
+    identity: Option<Identity>,
     lease_duration: Duration,
     renew_deadline: Duration,
     retry_period: Duration,
@@ -130,9 +192,12 @@ impl LeaderElection {
 }
 
 impl LeaderElectionBuilder {
-    /// Override the identity string. Defaults to `$HOSTNAME` (the pod name
-    /// when running in Kubernetes) or a fresh UUID.
-    pub fn identity(mut self, identity: impl Into<String>) -> Self {
+    /// Override the identity. Defaults to [`Identity::PodNameOrUuid`].
+    ///
+    /// `&str` and `String` convert into [`Identity::Custom`]
+    /// automatically, so `.identity("foo")` and
+    /// `.identity(Identity::Generated)` both work.
+    pub fn identity(mut self, identity: impl Into<Identity>) -> Self {
         self.identity = Some(identity.into());
         self
     }
@@ -176,9 +241,7 @@ impl LeaderElectionBuilder {
 
     /// Finalise the configuration.
     pub fn build(self) -> LeaderElection {
-        let identity = self.identity.unwrap_or_else(|| {
-            std::env::var("HOSTNAME").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string())
-        });
+        let identity = self.identity.unwrap_or_default().resolve();
         LeaderElection {
             client: self.client,
             namespace: self.namespace,
@@ -231,7 +294,7 @@ impl LeaderElection {
             }
         }
 
-        let (tx, rx) = watch::channel(true);
+        let (tx, rx) = watch::channel::<Option<StepDownReason>>(None);
         let handle = tokio::spawn({
             let client = self.client.clone();
             let namespace = self.namespace.clone();
@@ -274,30 +337,30 @@ impl LeaderElection {
         // lease as expired. Without this gap, a brief renewal hiccup
         // can race a takeover and produce two leaders.
         if self.renew_deadline >= self.lease_duration {
-            return Err(Error::InvalidConfig(format!(
-                "renew_deadline ({:?}) must be strictly less than lease_duration ({:?})",
-                self.renew_deadline, self.lease_duration,
-            )));
+            return Err(InvalidConfig::RenewDeadlineNotLess {
+                renew: self.renew_deadline,
+                lease: self.lease_duration,
+            }
+            .into());
         }
         if self.retry_period > self.renew_deadline {
-            return Err(Error::InvalidConfig(format!(
-                "retry_period ({:?}) must be <= renew_deadline ({:?})",
-                self.retry_period, self.renew_deadline,
-            )));
+            return Err(InvalidConfig::RetryPeriodTooLong {
+                retry: self.retry_period,
+                renew: self.renew_deadline,
+            }
+            .into());
         }
         if self.retry_period.is_zero() {
-            return Err(Error::InvalidConfig(
-                "retry_period must be greater than zero".into(),
-            ));
+            return Err(InvalidConfig::RetryPeriodZero.into());
         }
         if self.identity.is_empty() {
-            return Err(Error::InvalidConfig("identity must not be empty".into()));
+            return Err(InvalidConfig::IdentityEmpty.into());
         }
         if self.name.is_empty() {
-            return Err(Error::InvalidConfig("lease name must not be empty".into()));
+            return Err(InvalidConfig::NameEmpty.into());
         }
         if self.namespace.is_empty() {
-            return Err(Error::InvalidConfig("namespace must not be empty".into()));
+            return Err(InvalidConfig::NamespaceEmpty.into());
         }
         Ok(())
     }
@@ -309,36 +372,67 @@ impl LeaderElection {
 
 /// Handle returned by [`LeaderElection::acquire`]. Keeps the lease renewed
 /// until dropped or [`step_down`](LeaderGuard::step_down) is called.
+/// Why a [`LeaderGuard`] stopped being the leader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StepDownReason {
+    /// The renewal loop kept failing for longer than `renew_deadline`,
+    /// almost certainly because the Kubernetes API was unreachable.
+    /// Operators usually treat this as fatal and exit.
+    RenewDeadlineExceeded,
+    /// The Lease's `holder_identity` no longer matches ours — another
+    /// instance took over. Operators should shut down their
+    /// reconcilers; the new leader is already at work.
+    HolderChanged,
+    /// The renewal task was cancelled — typically because
+    /// [`LeaderGuard::step_down`] was called or the guard was dropped
+    /// before any other terminal condition was reached. Also surfaced
+    /// if the renewal task panicked.
+    Cancelled,
+}
+
+/// Active leader handle returned by [`LeaderElection::acquire`].
+///
+/// Hold the guard for the lifetime of your leader-only work. Dropping
+/// it (or calling [`step_down`](Self::step_down)) aborts the renewal
+/// task; [`lost`](Self::lost) resolves with a [`StepDownReason`] when
+/// you are no longer leader.
+#[non_exhaustive]
 pub struct LeaderGuard {
     client: Client,
     namespace: String,
     name: String,
     identity: String,
-    rx: watch::Receiver<bool>,
+    rx: watch::Receiver<Option<StepDownReason>>,
     renew_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl LeaderGuard {
-    /// Wait until this instance is no longer leader.
+    /// Wait until this instance is no longer leader, returning the
+    /// reason.
     ///
-    /// Resolves once the renewal task has signalled stepdown — either
-    /// because we lost the lease (renewal failed past `renew_deadline`,
-    /// or another instance now holds it) or because the renewal task
-    /// was aborted (e.g. by [`step_down`](Self::step_down) or guard
-    /// drop). Returns immediately on subsequent calls; safe to use in
-    /// `tokio::select!` next to your controller futures as a stepdown
-    /// signal.
-    pub async fn lost(&mut self) {
-        // `watch::Receiver::changed` returns Err only when all senders
-        // are dropped, which here means the renewal task has ended —
-        // either because it signalled stepdown (sender drops on return)
-        // or because it was aborted. Both mean "we're no longer leader."
-        let _ = self.rx.changed().await;
+    /// Resolves once the renewal task has signalled stepdown for any
+    /// of the cases enumerated by [`StepDownReason`]. Returns
+    /// immediately on subsequent calls — safe to use in
+    /// `tokio::select!` alongside your controller futures.
+    pub async fn lost(&mut self) -> StepDownReason {
+        loop {
+            if let Some(reason) = self.rx.borrow().clone() {
+                return reason;
+            }
+            if self.rx.changed().await.is_err() {
+                // All senders dropped without writing a reason — the
+                // renewal task was aborted (step_down / Drop) or it
+                // panicked. From the caller's perspective, we're no
+                // longer leader.
+                return StepDownReason::Cancelled;
+            }
+        }
     }
 
     /// `true` while we still hold the lease.
     pub fn is_leader(&self) -> bool {
-        *self.rx.borrow()
+        self.rx.borrow().is_none()
     }
 
     /// Cooperatively relinquish the lease — PATCH the Lease to clear our
@@ -598,7 +692,7 @@ async fn renew_loop(
     retry_period: Duration,
     renew_deadline: Duration,
     renew_request_timeout: Duration,
-    tx: watch::Sender<bool>,
+    tx: watch::Sender<Option<StepDownReason>>,
 ) {
     let leases: Api<Lease> = Api::namespaced(client, namespace);
     let lease_secs = lease_duration.as_secs() as i32;
@@ -623,7 +717,7 @@ async fn renew_loop(
             }
             Ok(Ok(RenewOutcome::Lost)) => {
                 warn!("lost leader lease — stepping down");
-                let _ = tx.send(false);
+                let _ = tx.send(Some(StepDownReason::HolderChanged));
                 return;
             }
             Ok(Err(e)) => {
@@ -634,7 +728,7 @@ async fn renew_loop(
                         "renew deadline exceeded — stepping down after {:?} since last success",
                         renew_deadline
                     );
-                    let _ = tx.send(false);
+                    let _ = tx.send(Some(StepDownReason::RenewDeadlineExceeded));
                     return;
                 }
             }
@@ -646,7 +740,7 @@ async fn renew_loop(
                         "renew deadline exceeded — stepping down after {:?} since last success",
                         renew_deadline
                     );
-                    let _ = tx.send(false);
+                    let _ = tx.send(Some(StepDownReason::RenewDeadlineExceeded));
                     return;
                 }
             }
@@ -1322,10 +1416,95 @@ mod tests {
         let mut guard = leader.acquire().await.expect("acquire must succeed");
         assert!(guard.is_leader(), "must be leader post-acquire");
 
-        tokio::time::timeout(Duration::from_secs(2), guard.lost())
+        let reason = tokio::time::timeout(Duration::from_secs(2), guard.lost())
             .await
             .expect("lost() must fire when renew sees a different holder");
+        assert_eq!(reason, StepDownReason::HolderChanged);
         assert!(!guard.is_leader(), "is_leader must be false post-stepdown");
+    }
+
+    #[tokio::test]
+    async fn guard_lost_returns_renew_deadline_exceeded_on_sustained_failure() {
+        // Acquire successfully, then PUT keeps 500-ing; once
+        // renew_deadline is exceeded the renew loop sends
+        // RenewDeadlineExceeded.
+        let server = MockServer::start().await;
+        // Initial GET (during try_acquire): we are holder.
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_held_by("me")))
+            .mount(&server)
+            .await;
+        // Initial PUT (own-renew during try_acquire): success.
+        Mock::given(method("PUT"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_held_by("me")))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Subsequent PUTs (renew loop): always 500.
+        Mock::given(method("PUT"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure", "code": 500,
+                "reason": "InternalError"
+            })))
+            .mount(&server)
+            .await;
+
+        let leader = LeaderElection::builder(mock_client(&server), "test-ns", "my-lease")
+            .identity("me")
+            .lease_duration(Duration::from_millis(200))
+            .renew_deadline(Duration::from_millis(100))
+            .retry_period(Duration::from_millis(20))
+            .renew_request_timeout(Duration::from_millis(50))
+            .build();
+        let mut guard = leader.acquire().await.expect("acquire must succeed");
+        assert!(guard.is_leader());
+
+        let reason = tokio::time::timeout(Duration::from_secs(2), guard.lost())
+            .await
+            .expect("lost() must fire when renew_deadline is exceeded");
+        assert_eq!(reason, StepDownReason::RenewDeadlineExceeded);
+    }
+
+    #[test]
+    fn invalid_config_carries_typed_values() {
+        // Pin that the new typed `InvalidConfig` enum carries the
+        // offending durations rather than just a string. Caller-side
+        // pattern matching depends on this.
+        let err: Error = InvalidConfig::RenewDeadlineNotLess {
+            renew: Duration::from_secs(10),
+            lease: Duration::from_secs(10),
+        }
+        .into();
+        assert!(matches!(
+            err,
+            Error::InvalidConfig(InvalidConfig::RenewDeadlineNotLess { .. })
+        ));
+    }
+
+    #[test]
+    fn identity_resolve_custom_passes_through() {
+        assert_eq!(Identity::Custom("me".into()).resolve(), "me");
+    }
+
+    #[test]
+    fn identity_resolve_generated_is_uuid_shaped() {
+        let s = Identity::Generated.resolve();
+        assert_eq!(s.len(), 36, "UUID v4 string is 36 chars: {s}");
+        assert_eq!(s.matches('-').count(), 4);
+    }
+
+    #[test]
+    fn identity_default_is_pod_name_or_uuid() {
+        assert!(matches!(Identity::default(), Identity::PodNameOrUuid));
     }
 
     // -----------------------------------------------------------------------
