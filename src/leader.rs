@@ -94,24 +94,19 @@ const DEFAULT_RENEW_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// The default ([`Identity::PodNameOrUuid`]) is the right choice in
 /// Kubernetes — `$HOSTNAME` is the pod name, which is unique within
 /// the cluster.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub enum Identity {
     /// Use `$HOSTNAME`. Falls back to a fresh UUID if the variable is
     /// unset, empty, or unreadable. Recommended default in
     /// Kubernetes.
+    #[default]
     PodNameOrUuid,
     /// Always generate a fresh UUID, ignoring `$HOSTNAME`. Useful for
     /// non-Kubernetes uses or when the host name is not unique.
     Generated,
     /// Use this exact string. The caller is responsible for uniqueness.
     Custom(String),
-}
-
-impl Default for Identity {
-    fn default() -> Self {
-        Self::PodNameOrUuid
-    }
 }
 
 impl Identity {
