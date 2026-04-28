@@ -24,7 +24,7 @@ your own `Cargo.toml`:
 
 ```toml
 [dependencies]
-kunobi-ha = { version = "0.1", features = ["v1_31"] }
+kunobi-ha = { version = "0.4", features = ["v1_31"] }
 ```
 
 Available proxy features: `v1_31`, `v1_32`, `v1_33`, `v1_34`, `v1_35`,
@@ -35,7 +35,7 @@ a `v1_xx` feature enabled, you don't need a proxy feature here.
 ## Leader election
 
 ```rust
-use kunobi_ha::leader::LeaderElection;
+use kunobi_ha::leader::{LeaderElection, StepDownReason};
 use std::time::Duration;
 
 #[tokio::main]
@@ -51,11 +51,13 @@ async fn main() -> anyhow::Result<()> {
     // Block until we're leader.
     let mut guard = leader.acquire().await?;
 
-    // Start your controllers here. `guard.lost()` fires when we lose
-    // the lease (renewal failed past `renew_deadline`).
+    // `guard.lost()` resolves with a `StepDownReason` when we are no
+    // longer leader: sustained renewal failures, another instance
+    // taking over, or the renewal task being cancelled by step_down /
+    // guard drop.
     tokio::select! {
-        _ = guard.lost() => {
-            eprintln!("lost leader lease, shutting down");
+        reason = guard.lost() => {
+            eprintln!("lost leader lease ({reason:?}), shutting down");
         }
         _ = run_my_controllers() => {}
     }
@@ -94,28 +96,44 @@ Follows the Kubernetes reference (`leaderelection.LeaderElectionConfig`):
 zero `retry_period`, empty identity/name/namespace) with
 `Error::InvalidConfig` rather than silently misbehaving.
 
-### Key differences from the Kubernetes reference
+### Behavioural notes
 
-- **Cooperative step-down on shutdown.** `guard.step_down().await` clears
-  `holder_identity` on the Lease so the next replica takes over within
-  `retry_period` instead of waiting for the full TTL. Most reference
-  implementations (including the original Go one) leave this optional —
-  we make it ergonomic, and the acquire path notices a cleared holder
-  immediately rather than waiting for renewal expiry.
-- **Deadline-based, not failure-count-based.** A leader steps down when
-  it has been unable to renew for longer than `renew_deadline`, not
-  after N consecutive failures. Handles flappy networks more gracefully.
+- **Cooperative step-down on shutdown.** `guard.step_down().await`
+  clears `holder_identity` on the Lease so the next replica takes
+  over within `retry_period` instead of waiting for the full TTL.
+  Equivalent to client-go's `ReleaseOnCancel`, but always-on rather
+  than opt-in. The acquire path also short-circuits when it sees a
+  cleared holder, so even if the next replica doesn't notice
+  mid-tick, the very next poll picks it up.
+- **Transient-error tolerance during renewal.** A 5xx, HTTP timeout,
+  or 409 on a renewal PUT does not immediately step down — only a
+  sustained failure past `renew_deadline` does. The renew loop
+  distinguishes "another instance took over" (`StepDownReason::HolderChanged`)
+  from "API hiccup" (retried until `RenewDeadlineExceeded`).
+- **Typed identity.** `Identity::PodNameOrUuid` (the default) reads
+  `$HOSTNAME`, falling back to a UUID. `Identity::Generated` always
+  generates a UUID. `Identity::Custom("…")` lets you pin a specific
+  string. `&str` and `String` `Into<Identity>` automatically, so
+  `.identity("foo")` still works.
 
 ## RBAC
 
-Your controller's ServiceAccount needs:
+Your controller's ServiceAccount needs the minimum verbs the crate
+actually issues — `get` (read the Lease), `create` (first acquire when
+the Lease doesn't exist yet), `update` (renew, take over, cooperative
+step-down all use PUT):
 
 ```yaml
 rules:
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
-    verbs: [get, list, watch, create, update, patch, delete]
+    resourceNames: [my-operator]   # optional: tighten to the lease(s) you own
+    verbs: [get, create, update]
 ```
+
+`list`, `watch`, `patch`, `delete` are **not** required. If your
+ServiceAccount already has them for other reasons that's fine, but
+this crate doesn't issue any of those verbs.
 
 ## Testing
 

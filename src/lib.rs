@@ -12,15 +12,23 @@
 //!
 //! ```no_run
 //! # async fn run(client: kube::Client) -> kunobi_ha::Result<()> {
-//! use kunobi_ha::leader::LeaderElection;
+//! use kunobi_ha::leader::{LeaderElection, StepDownReason};
 //!
 //! let leader = LeaderElection::builder(client, "my-ns", "my-operator").build();
 //! let mut guard = leader.acquire().await?;
 //!
-//! // Start your controllers here. `guard.lost()` fires when we lose
-//! // the lease (renewal failed past `renew_deadline`).
-//! // Call `guard.step_down().await` in your SIGTERM handler to let the
-//! // next replica take over immediately instead of waiting for TTL.
+//! // Start your controllers here. `guard.lost()` resolves when we
+//! // are no longer leader, returning a `StepDownReason` describing
+//! // why (renewal-deadline exceeded, holder changed, or cancelled).
+//! // Call `guard.step_down().await` in your SIGTERM handler to let
+//! // the next replica take over immediately instead of waiting for
+//! // TTL.
+//! match guard.lost().await {
+//!     StepDownReason::RenewDeadlineExceeded => {} // API was unreachable
+//!     StepDownReason::HolderChanged => {}         // another replica took over
+//!     StepDownReason::Cancelled => {}             // step_down() / drop
+//!     _ => {}                                     // future variants
+//! }
 //! # Ok(())
 //! # }
 //! ```
@@ -35,4 +43,4 @@
 pub mod error;
 pub mod leader;
 
-pub use error::{Error, Result};
+pub use error::{Error, InvalidConfig, Result};

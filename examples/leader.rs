@@ -35,8 +35,8 @@ async fn main() -> anyhow::Result<()> {
     info!("became leader");
 
     tokio::select! {
-        _ = guard.lost() => {
-            info!("lost lease, exiting so the next replica can take over");
+        reason = guard.lost() => {
+            info!(?reason, "lost lease, exiting so the next replica can take over");
         }
         res = signal::ctrl_c() => {
             res?;
