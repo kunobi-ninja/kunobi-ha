@@ -30,7 +30,7 @@ your own `Cargo.toml`:
 
 ```toml
 [dependencies]
-kunobi-ha = { version = "0.4.1", features = ["v1_31"] }
+kunobi-ha = { version = "0.5.0", features = ["v1_31"] }
 ```
 
 Available proxy features: `v1_31`, `v1_32`, `v1_33`, `v1_34`, `v1_35`,
