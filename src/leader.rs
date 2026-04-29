@@ -307,8 +307,10 @@ impl LeaderElectionBuilder {
     /// up-for-grabs once `now > last_renew + lease_duration`.
     ///
     /// Default: 15s. Must be strictly greater than
-    /// [`renew_deadline`](Self::renew_deadline) — see the timing
-    /// model in the [module docs](self).
+    /// [`renew_deadline`](Self::renew_deadline), at least one whole
+    /// second, and fit Kubernetes' signed 32-bit
+    /// `leaseDurationSeconds` field — see the timing model in the
+    /// [module docs](self).
     pub fn lease_duration(mut self, duration: Duration) -> Self {
         self.lease_duration = duration;
         self
@@ -356,6 +358,10 @@ impl LeaderElectionBuilder {
     /// cumulative budget across multiple failed renewal attempts.
     ///
     /// Default: 5s.
+    ///
+    /// Must be `<= renew_deadline`; otherwise one stuck request could
+    /// outlive the leader's renewal budget while readiness still reports
+    /// leader.
     pub fn renew_request_timeout(mut self, duration: Duration) -> Self {
         self.renew_request_timeout = duration;
         self
@@ -437,6 +443,7 @@ impl LeaderElection {
     /// (we recognise our own identity and renew rather than create).
     pub async fn acquire(&self) -> Result<LeaderGuard> {
         self.validate()?;
+        let lease_secs = lease_duration_seconds(self.lease_duration)?;
 
         let leases: Api<Lease> = Api::namespaced(self.client.clone(), &self.namespace);
 
@@ -444,7 +451,7 @@ impl LeaderElection {
 
         let mut observe_error_deadline: Option<tokio::time::Instant> = None;
         loop {
-            match try_acquire(&leases, &self.name, &self.identity, self.lease_duration).await {
+            match try_acquire(&leases, &self.name, &self.identity, lease_secs).await {
                 Ok(true) => {
                     info!(identity = %self.identity, "acquired leader lease");
                     break;
@@ -479,7 +486,6 @@ impl LeaderElection {
             let identity = self.identity.clone();
             let retry_period = self.retry_period;
             let renew_deadline = self.renew_deadline;
-            let lease_duration = self.lease_duration;
             let renew_request_timeout = self.renew_request_timeout;
             let state = self.state.clone();
             async move {
@@ -488,7 +494,7 @@ impl LeaderElection {
                     &namespace,
                     &name,
                     &identity,
-                    lease_duration,
+                    lease_secs,
                     retry_period,
                     renew_deadline,
                     renew_request_timeout,
@@ -511,6 +517,8 @@ impl LeaderElection {
     }
 
     fn validate(&self) -> Result<()> {
+        let _ = lease_duration_seconds(self.lease_duration)?;
+
         // The 2/3 rule: a leader must finish renewing within
         // `renew_deadline`, which has to leave enough margin under
         // `lease_duration` for the next replica to safely treat the
@@ -532,6 +540,13 @@ impl LeaderElection {
         }
         if self.retry_period.is_zero() {
             return Err(InvalidConfig::RetryPeriodZero.into());
+        }
+        if self.renew_request_timeout > self.renew_deadline {
+            return Err(InvalidConfig::RenewRequestTimeoutTooLong {
+                timeout: self.renew_request_timeout,
+                renew: self.renew_deadline,
+            }
+            .into());
         }
         if self.identity.is_empty() {
             return Err(InvalidConfig::IdentityEmpty.into());
@@ -635,8 +650,9 @@ impl LeaderGuard {
                 // All senders dropped without writing a reason — the
                 // renewal task was aborted (step_down / Drop) or it
                 // panicked. From the caller's perspective, we're no
-                // longer leader, and the state handle has already
-                // been cleared by step_down_inner / Drop.
+                // longer leader. Clear state here as a backstop for the
+                // panic path, where Drop/step_down_inner did not run.
+                self.state.set(false);
                 return StepDownReason::Cancelled;
             }
         }
@@ -653,7 +669,11 @@ impl LeaderGuard {
     /// [`LeaderElection::state`] — it doesn't require borrowing the
     /// guard.
     pub fn is_leader(&self) -> bool {
-        self.rx.borrow().is_none()
+        if self.rx.has_changed().is_err() {
+            self.state.set(false);
+            return false;
+        }
+        self.rx.borrow().is_none() && self.state.is_leader()
     }
 
     /// Cooperatively relinquish the lease.
@@ -734,6 +754,28 @@ fn timestamp_to_chrono(ts: &k8s_openapi::jiff::Timestamp) -> Option<chrono::Date
     chrono::DateTime::from_timestamp(ts.as_second(), 0)
 }
 
+fn lease_duration_seconds(lease_duration: Duration) -> Result<i32> {
+    if lease_duration.as_secs() == 0 {
+        return Err(InvalidConfig::LeaseDurationTooSmall {
+            lease: lease_duration,
+        }
+        .into());
+    }
+    if lease_duration.subsec_nanos() != 0 {
+        return Err(InvalidConfig::LeaseDurationNotWholeSeconds {
+            lease: lease_duration,
+        }
+        .into());
+    }
+    i32::try_from(lease_duration.as_secs()).map_err(|_| {
+        InvalidConfig::LeaseDurationTooLarge {
+            lease: lease_duration,
+            max_seconds: i32::MAX as u64,
+        }
+        .into()
+    })
+}
+
 /// Pure helper: has the lease passed its TTL relative to its last
 /// renewal? Used by `try_acquire` to decide whether a lease held by
 /// someone else is up for grabs.
@@ -752,11 +794,10 @@ async fn try_acquire(
     leases: &Api<Lease>,
     name: &str,
     identity: &str,
-    lease_duration: Duration,
+    lease_secs: i32,
 ) -> Result<bool> {
     let now = chrono::Utc::now();
     let micro_now = MicroTime(chrono_to_timestamp(now)?);
-    let lease_secs = lease_duration.as_secs() as i32;
 
     match leases.get(name).await {
         Ok(mut existing) => {
@@ -935,7 +976,7 @@ async fn renew_loop(
     namespace: &str,
     lease_name: &str,
     identity: &str,
-    lease_duration: Duration,
+    lease_secs: i32,
     retry_period: Duration,
     renew_deadline: Duration,
     renew_request_timeout: Duration,
@@ -943,7 +984,6 @@ async fn renew_loop(
     tx: watch::Sender<Option<StepDownReason>>,
 ) {
     let leases: Api<Lease> = Api::namespaced(client, namespace);
-    let lease_secs = lease_duration.as_secs() as i32;
     let mut interval = tokio::time::interval(retry_period);
     // Tick once immediately after acquire to avoid the first-tick burst
     // race with the initial create/replace.
@@ -1180,6 +1220,7 @@ mod tests {
         }
 
         /// `validate` accepts iff every documented invariant holds:
+        ///   lease_duration is representable as Kubernetes integer seconds
         ///   renew_deadline < lease_duration
         ///   retry_period <= renew_deadline
         ///   retry_period > 0
@@ -1207,11 +1248,15 @@ mod tests {
                     .lease_duration(lease)
                     .renew_deadline(renew)
                     .retry_period(retry)
+                    .renew_request_timeout(renew)
                     .build();
                 le.validate()
             });
 
-            let valid = renew < lease && retry <= renew && !retry.is_zero();
+            let lease_representable = lease.as_secs() > 0
+                && lease.subsec_nanos() == 0
+                && lease.as_secs() <= i32::MAX as u64;
+            let valid = lease_representable && renew < lease && retry <= renew && !retry.is_zero();
             prop_assert_eq!(result.is_ok(), valid);
         }
     }
@@ -1290,6 +1335,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validate_rejects_subsecond_lease_duration() {
+        let server = MockServer::start().await;
+        let le = LeaderElection::builder(mock_client(&server), "ns", "lease")
+            .identity("me")
+            .lease_duration(Duration::from_millis(100))
+            .renew_deadline(Duration::from_millis(50))
+            .retry_period(Duration::from_millis(10))
+            .renew_request_timeout(Duration::from_millis(50))
+            .build();
+        let err = le
+            .validate()
+            .expect_err("sub-second lease duration must reject");
+        assert!(
+            matches!(
+                err,
+                Error::InvalidConfig(InvalidConfig::LeaseDurationTooSmall { .. })
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_non_whole_second_lease_duration() {
+        let server = MockServer::start().await;
+        let le = LeaderElection::builder(mock_client(&server), "ns", "lease")
+            .identity("me")
+            .lease_duration(Duration::from_millis(1_500))
+            .renew_deadline(Duration::from_millis(500))
+            .retry_period(Duration::from_millis(100))
+            .renew_request_timeout(Duration::from_millis(500))
+            .build();
+        let err = le
+            .validate()
+            .expect_err("non-whole-second lease duration must reject");
+        assert!(
+            matches!(
+                err,
+                Error::InvalidConfig(InvalidConfig::LeaseDurationNotWholeSeconds { .. })
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_too_large_lease_duration() {
+        let server = MockServer::start().await;
+        let le = LeaderElection::builder(mock_client(&server), "ns", "lease")
+            .identity("me")
+            .lease_duration(Duration::from_secs(i32::MAX as u64 + 1))
+            .renew_deadline(Duration::from_secs(10))
+            .retry_period(Duration::from_secs(1))
+            .build();
+        let err = le
+            .validate()
+            .expect_err("oversized lease duration must reject");
+        assert!(
+            matches!(
+                err,
+                Error::InvalidConfig(InvalidConfig::LeaseDurationTooLarge { .. })
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_renew_request_timeout_gt_renew_deadline() {
+        let server = MockServer::start().await;
+        let le = LeaderElection::builder(mock_client(&server), "ns", "lease")
+            .identity("me")
+            .lease_duration(Duration::from_secs(15))
+            .renew_deadline(Duration::from_secs(10))
+            .retry_period(Duration::from_secs(2))
+            .renew_request_timeout(Duration::from_secs(11))
+            .build();
+        let err = le
+            .validate()
+            .expect_err("renew request timeout must fit inside renew deadline");
+        assert!(
+            matches!(
+                err,
+                Error::InvalidConfig(InvalidConfig::RenewRequestTimeoutTooLong { .. })
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn validate_rejects_renew_equals_lease_exact_boundary() {
         // Pin the `>=` boundary: equality is rejected, not just `>`. Without
         // this case, a mutant flipping `>=` to `>` would survive.
@@ -1351,9 +1483,10 @@ mod tests {
 
         let leader = LeaderElection::builder(mock_client(&server), "test-ns", "my-lease")
             .identity("me")
-            .lease_duration(Duration::from_millis(100))
+            .lease_duration(Duration::from_secs(1))
             .renew_deadline(Duration::from_millis(50))
             .retry_period(Duration::from_millis(10))
+            .renew_request_timeout(Duration::from_millis(50))
             .observe_timeout(Duration::from_millis(150))
             .build();
 
@@ -1397,7 +1530,7 @@ mod tests {
             .await;
 
         let leases: Api<Lease> = Api::namespaced(mock_client(&server), "test-ns");
-        let err = try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION)
+        let err = try_acquire(&leases, "my-lease", "me", 15)
             .await
             .expect_err("500 must surface as Err, not Ok(false)");
         // Pin the specific upstream status code. Without this, a mutant
@@ -1444,7 +1577,7 @@ mod tests {
             .await;
 
         let leases: Api<Lease> = Api::namespaced(mock_client(&server), "test-ns");
-        let err = try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION)
+        let err = try_acquire(&leases, "my-lease", "me", 15)
             .await
             .expect_err("POST 500 must surface as Err");
         assert!(matches!(err, Error::Kube(_)), "got {err:?}");
@@ -1485,7 +1618,7 @@ mod tests {
             .await;
 
         let leases: Api<Lease> = Api::namespaced(mock_client(&server), "test-ns");
-        let err = try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION)
+        let err = try_acquire(&leases, "my-lease", "me", 15)
             .await
             .expect_err("PUT 500 must surface as Err");
         assert!(matches!(err, Error::Kube(_)), "got {err:?}");
@@ -1592,9 +1725,10 @@ mod tests {
 
         let leader = LeaderElection::builder(mock_client(&server), "test-ns", "my-lease")
             .identity("me")
-            .lease_duration(Duration::from_millis(200))
+            .lease_duration(Duration::from_secs(1))
             .renew_deadline(Duration::from_millis(100))
             .retry_period(Duration::from_millis(20))
+            .renew_request_timeout(Duration::from_millis(50))
             .build();
 
         let guard = leader.acquire().await.expect("acquire must succeed");
@@ -1665,7 +1799,7 @@ mod tests {
 
         let leader = LeaderElection::builder(mock_client(&server), "test-ns", "my-lease")
             .identity("me")
-            .lease_duration(Duration::from_millis(200))
+            .lease_duration(Duration::from_secs(1))
             .renew_deadline(Duration::from_millis(100))
             .retry_period(Duration::from_millis(20))
             .renew_request_timeout(Duration::from_millis(50))
@@ -1717,7 +1851,7 @@ mod tests {
 
         let leader = LeaderElection::builder(mock_client(&server), "test-ns", "my-lease")
             .identity("me")
-            .lease_duration(Duration::from_millis(200))
+            .lease_duration(Duration::from_secs(1))
             .renew_deadline(Duration::from_millis(100))
             .retry_period(Duration::from_millis(20))
             .renew_request_timeout(Duration::from_millis(50))
@@ -1836,6 +1970,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guard_lost_clears_state_when_sender_drops_without_reason() {
+        let server = MockServer::start().await;
+        let (tx, rx) = watch::channel::<Option<StepDownReason>>(None);
+        drop(tx);
+        let state = LeaderState::new();
+        state.set(true);
+        let mut guard = LeaderGuard {
+            client: mock_client(&server),
+            namespace: "test-ns".into(),
+            name: "my-lease".into(),
+            identity: "me".into(),
+            rx,
+            renew_handle: None,
+            state: state.clone(),
+        };
+
+        let reason = guard.lost().await;
+
+        assert_eq!(reason, StepDownReason::Cancelled);
+        assert!(
+            !state.is_leader(),
+            "lost() must clear LeaderState when the renew task disappears"
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_is_leader_clears_state_when_sender_drops_without_reason() {
+        let server = MockServer::start().await;
+        let (tx, rx) = watch::channel::<Option<StepDownReason>>(None);
+        drop(tx);
+        let state = LeaderState::new();
+        state.set(true);
+        let guard = LeaderGuard {
+            client: mock_client(&server),
+            namespace: "test-ns".into(),
+            name: "my-lease".into(),
+            identity: "me".into(),
+            rx,
+            renew_handle: None,
+            state: state.clone(),
+        };
+
+        assert!(
+            !guard.is_leader(),
+            "closed sender without a reason means we are no longer leader"
+        );
+        assert!(
+            !state.is_leader(),
+            "is_leader() must clear stale readiness state"
+        );
+    }
+
+    #[tokio::test]
     async fn leader_state_clears_before_lost_resolves() {
         // The headline guarantee: an HTTP `/readyz` handler reading
         // `LeaderState::is_leader()` must observe `false` BEFORE
@@ -1860,7 +2047,7 @@ mod tests {
 
         let leader = LeaderElection::builder(mock_client(&server), "test-ns", "my-lease")
             .identity("me")
-            .lease_duration(Duration::from_millis(200))
+            .lease_duration(Duration::from_secs(1))
             .renew_deadline(Duration::from_millis(100))
             .retry_period(Duration::from_millis(20))
             .renew_request_timeout(Duration::from_millis(50))
@@ -1927,7 +2114,7 @@ mod tests {
 
         let client = mock_client(&server);
         let leases: Api<Lease> = Api::namespaced(client, "test-ns");
-        let got = try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION).await;
+        let got = try_acquire(&leases, "my-lease", "me", 15).await;
         assert!(got.unwrap(), "should acquire by creating the lease");
     }
 
@@ -1967,11 +2154,7 @@ mod tests {
 
         let client = mock_client(&server);
         let leases: Api<Lease> = Api::namespaced(client, "test-ns");
-        assert!(
-            try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION)
-                .await
-                .unwrap()
-        );
+        assert!(try_acquire(&leases, "my-lease", "me", 15).await.unwrap());
     }
 
     #[tokio::test]
@@ -1999,11 +2182,7 @@ mod tests {
 
         let client = mock_client(&server);
         let leases: Api<Lease> = Api::namespaced(client, "test-ns");
-        assert!(
-            !try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION)
-                .await
-                .unwrap()
-        );
+        assert!(!try_acquire(&leases, "my-lease", "me", 15).await.unwrap());
     }
 
     #[tokio::test]
@@ -2060,11 +2239,7 @@ mod tests {
 
         let client = mock_client(&server);
         let leases: Api<Lease> = Api::namespaced(client, "test-ns");
-        assert!(
-            try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION)
-                .await
-                .unwrap()
-        );
+        assert!(try_acquire(&leases, "my-lease", "me", 15).await.unwrap());
     }
 
     #[tokio::test]
@@ -2112,9 +2287,7 @@ mod tests {
         let client = mock_client(&server);
         let leases: Api<Lease> = Api::namespaced(client, "test-ns");
         assert!(
-            try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION)
-                .await
-                .unwrap(),
+            try_acquire(&leases, "my-lease", "me", 15).await.unwrap(),
             "must take over a lease whose holder_identity has been cleared"
         );
     }
@@ -2160,9 +2333,7 @@ mod tests {
         let client = mock_client(&server);
         let leases: Api<Lease> = Api::namespaced(client, "test-ns");
         assert!(
-            !try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION)
-                .await
-                .unwrap(),
+            !try_acquire(&leases, "my-lease", "me", 15).await.unwrap(),
             "409 on takeover PUT must yield Ok(false), not Err"
         );
     }
@@ -2193,11 +2364,7 @@ mod tests {
 
         let client = mock_client(&server);
         let leases: Api<Lease> = Api::namespaced(client, "test-ns");
-        assert!(
-            !try_acquire(&leases, "my-lease", "me", DEFAULT_LEASE_DURATION)
-                .await
-                .unwrap()
-        );
+        assert!(!try_acquire(&leases, "my-lease", "me", 15).await.unwrap());
     }
 
     #[tokio::test]

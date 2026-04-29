@@ -75,6 +75,31 @@ pub enum InvalidConfig {
         lease: Duration,
     },
 
+    /// `lease_duration` cannot be represented safely in Kubernetes'
+    /// integer `leaseDurationSeconds` field.
+    #[error("lease_duration ({lease:?}) must be at least one whole second")]
+    LeaseDurationTooSmall {
+        /// Configured `lease_duration`.
+        lease: Duration,
+    },
+
+    /// `lease_duration` includes sub-second precision, but Kubernetes
+    /// stores Lease durations as integer seconds.
+    #[error("lease_duration ({lease:?}) must be a whole number of seconds")]
+    LeaseDurationNotWholeSeconds {
+        /// Configured `lease_duration`.
+        lease: Duration,
+    },
+
+    /// `lease_duration` exceeds Kubernetes' signed 32-bit seconds field.
+    #[error("lease_duration ({lease:?}) must be <= {max_seconds}s")]
+    LeaseDurationTooLarge {
+        /// Configured `lease_duration`.
+        lease: Duration,
+        /// Maximum representable Lease duration in seconds.
+        max_seconds: u64,
+    },
+
     /// `retry_period` is greater than `renew_deadline`. The follower
     /// poll cadence cannot exceed the leader's renewal deadline; the
     /// algorithm relies on followers checking the lease at least as
@@ -83,6 +108,17 @@ pub enum InvalidConfig {
     RetryPeriodTooLong {
         /// Configured `retry_period`.
         retry: Duration,
+        /// Configured `renew_deadline`.
+        renew: Duration,
+    },
+
+    /// `renew_request_timeout` is greater than `renew_deadline`, so a
+    /// single stuck renewal request can outlive the leader's allowed
+    /// renewal window while readiness still reports leader.
+    #[error("renew_request_timeout ({timeout:?}) must be <= renew_deadline ({renew:?})")]
+    RenewRequestTimeoutTooLong {
+        /// Configured `renew_request_timeout`.
+        timeout: Duration,
         /// Configured `renew_deadline`.
         renew: Duration,
     },
