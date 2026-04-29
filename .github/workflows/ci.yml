@@ -25,7 +25,7 @@ jobs:
     runs-on: kunobi-runners
     container:
       image: rust:1.94.1-bookworm
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -46,6 +46,11 @@ jobs:
 
       - name: Add Rust components
         run: rustup component add rustfmt clippy
+
+      - name: Install coverage tool
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin@0.35.4
 
       - name: Check formatting
         run: cargo fmt --check
@@ -71,6 +76,19 @@ jobs:
 
       - name: Tests
         run: cargo test
+
+      # Do not use `--all-features`: the k8s-openapi proxy features
+      # (`v1_31` ... `latest`) are mutually exclusive.
+      - name: Coverage
+        run: cargo tarpaulin --engine llvm --workspace --out Json --output-dir coverage --fail-under 50
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/tarpaulin-report.json
+          if-no-files-found: warn
 
       - name: Build docs
         run: cargo doc --lib --no-deps --features latest

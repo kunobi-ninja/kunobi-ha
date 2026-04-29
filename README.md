@@ -210,6 +210,12 @@ this crate doesn't issue any of those verbs.
 
 ## Testing
 
+Tooling is pinned via [`mise`](https://mise.jdx.dev):
+
+```bash
+mise install
+```
+
 ```bash
 cargo test
 ```
@@ -220,10 +226,27 @@ needed.
 Dependency hygiene is checked with [`cargo-deny`](https://embarkstudios.github.io/cargo-deny/):
 
 ```bash
-cargo deny check
+mise run deny
 ```
 
 Configuration lives in [`deny.toml`](deny.toml).
+
+Coverage is measured with [`cargo-tarpaulin`](https://github.com/xd009642/tarpaulin).
+CI uses the same LLVM engine with a conservative initial `50%` floor and
+uploads `coverage/tarpaulin-report.json` as an artifact.
+
+```bash
+mise run coverage       # JSON report in ./coverage
+mise run coverage:html  # HTML report in ./coverage
+```
+
+Mutation testing is local-only because it is slower than the normal CI
+path. The focused default mirrors the currently mutation-audited surface:
+
+```bash
+mise run mutants
+mise run mutants:file -- src/leader.rs
+```
 
 ## Roadmap
 

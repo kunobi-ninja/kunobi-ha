@@ -1,0 +1,38 @@
+# Toolchain pinning for local development and CI-adjacent checks.
+#
+# Local: install `mise` (https://mise.jdx.dev), then `mise install` in this
+# directory provisions the tools below.
+
+[tools]
+# Match the CI image (`rust:1.94.1-bookworm`) for reproducibility.
+rust = "1.94.1"
+
+# cargo-deny is distributed through aqua in mise's registry.
+"aqua:EmbarkStudios/cargo-deny" = "0.19.4"
+
+# Local-only heavier analysis is installed on demand by the tasks below, so
+# everyday commands like `mise run deny` do not have to provision those tools.
+
+[env]
+# Honour the version above, even if a global rustup override is set.
+RUSTUP_TOOLCHAIN = "1.94.1"
+
+[tasks.deny]
+description = "Run cargo-deny policy checks."
+run = "cargo deny check"
+
+[tasks.coverage]
+description = "Run Rust test coverage with cargo-tarpaulin."
+run = "mise exec cargo:cargo-tarpaulin@0.35.4 -- cargo tarpaulin --engine llvm --workspace --out Json --output-dir coverage"
+
+[tasks."coverage:html"]
+description = "Run Rust test coverage and render an HTML report."
+run = "mise exec cargo:cargo-tarpaulin@0.35.4 -- cargo tarpaulin --engine llvm --workspace --out Html --output-dir coverage"
+
+[tasks.mutants]
+description = "Run cargo-mutants against the leader-election implementation."
+run = "mise exec cargo:cargo-mutants@27.0.0 -- cargo mutants --no-times --timeout-multiplier 2 --file src/leader.rs --file src/error.rs"
+
+[tasks."mutants:file"]
+description = "Run cargo-mutants on one file, e.g. `mise run mutants:file -- src/leader.rs`."
+run = "mise exec cargo:cargo-mutants@27.0.0 -- cargo mutants --no-times --timeout-multiplier 2 --file"
