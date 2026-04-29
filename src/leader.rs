@@ -1277,6 +1277,13 @@ mod tests {
         Client::try_from(config).expect("build mock kube client")
     }
 
+    async fn acquire_ok(leader: &LeaderElection) -> LeaderGuard {
+        tokio::time::timeout(Duration::from_secs(2), leader.acquire())
+            .await
+            .expect("acquire timed out")
+            .expect("acquire must succeed")
+    }
+
     // -----------------------------------------------------------------------
     // Config validation
     // -----------------------------------------------------------------------
@@ -1304,7 +1311,7 @@ mod tests {
             Duration::from_secs(10),
             Duration::from_secs(2),
         );
-        let err = le.acquire().await.err().expect("must reject renew>=lease");
+        let err = le.validate().expect_err("must reject renew>=lease");
         assert!(matches!(err, Error::InvalidConfig(_)), "got {err:?}");
     }
 
@@ -1317,7 +1324,7 @@ mod tests {
             Duration::from_secs(2),
             Duration::from_secs(5),
         );
-        let err = le.acquire().await.err().expect("must reject retry>renew");
+        let err = le.validate().expect_err("must reject retry>renew");
         assert!(matches!(err, Error::InvalidConfig(_)), "got {err:?}");
     }
 
@@ -1330,7 +1337,7 @@ mod tests {
             Duration::from_secs(10),
             Duration::ZERO,
         );
-        let err = le.acquire().await.err().expect("must reject zero retry");
+        let err = le.validate().expect_err("must reject zero retry");
         assert!(matches!(err, Error::InvalidConfig(_)), "got {err:?}");
     }
 
@@ -1491,7 +1498,9 @@ mod tests {
             .build();
 
         let start = tokio::time::Instant::now();
-        let result = leader.acquire().await;
+        let result = tokio::time::timeout(Duration::from_secs(2), leader.acquire())
+            .await
+            .expect("acquire must finish within observe_timeout");
         let elapsed = start.elapsed();
 
         assert!(result.is_err(), "must error after sustained 5xx");
@@ -1668,7 +1677,7 @@ mod tests {
         let leader = LeaderElection::builder(mock_client(&server), "test-ns", "my-lease")
             .identity("me")
             .build();
-        let guard = leader.acquire().await.expect("acquire must succeed");
+        let guard = acquire_ok(&leader).await;
         assert!(guard.is_leader(), "is_leader must be true post-acquire");
         guard.step_down().await;
 
@@ -1731,7 +1740,7 @@ mod tests {
             .renew_request_timeout(Duration::from_millis(50))
             .build();
 
-        let guard = leader.acquire().await.expect("acquire must succeed");
+        let guard = acquire_ok(&leader).await;
         // Let the renew loop's first tick complete so `baseline` is
         // stable.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1804,7 +1813,7 @@ mod tests {
             .retry_period(Duration::from_millis(20))
             .renew_request_timeout(Duration::from_millis(50))
             .build();
-        let mut guard = leader.acquire().await.expect("acquire must succeed");
+        let mut guard = acquire_ok(&leader).await;
         assert!(guard.is_leader(), "must be leader post-acquire");
 
         let reason = tokio::time::timeout(Duration::from_secs(2), guard.lost())
@@ -1856,7 +1865,7 @@ mod tests {
             .retry_period(Duration::from_millis(20))
             .renew_request_timeout(Duration::from_millis(50))
             .build();
-        let mut guard = leader.acquire().await.expect("acquire must succeed");
+        let mut guard = acquire_ok(&leader).await;
         assert!(guard.is_leader());
 
         let reason = tokio::time::timeout(Duration::from_secs(2), guard.lost())
@@ -1894,8 +1903,34 @@ mod tests {
     }
 
     #[test]
+    fn identity_resolve_pod_name_prefers_hostname() {
+        const CHILD_MARKER: &str = "KUNOBI_HA_IDENTITY_HOSTNAME_CHILD";
+        if std::env::var(CHILD_MARKER).as_deref() != Ok("1") {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("current test binary path"),
+            )
+            .arg("--exact")
+            .arg("leader::tests::identity_resolve_pod_name_prefers_hostname")
+            .env(CHILD_MARKER, "1")
+            .env("HOSTNAME", "kunobi-pod")
+            .status()
+            .expect("run child test with controlled HOSTNAME");
+            assert!(status.success(), "child HOSTNAME test failed");
+            return;
+        }
+
+        assert_eq!(Identity::PodNameOrUuid.resolve(), "kunobi-pod");
+    }
+
+    #[test]
     fn identity_default_is_pod_name_or_uuid() {
         assert!(matches!(Identity::default(), Identity::PodNameOrUuid));
+    }
+
+    #[test]
+    fn identity_from_string_preserves_custom_value() {
+        let identity: Identity = String::from("from-string").into();
+        assert!(matches!(identity, Identity::Custom(s) if s == "from-string"));
     }
 
     // -----------------------------------------------------------------------
@@ -1934,7 +1969,7 @@ mod tests {
         assert!(!probe_handle.is_leader());
         assert!(!internal_handle.is_leader());
 
-        let guard = leader.acquire().await.expect("acquire must succeed");
+        let guard = acquire_ok(&leader).await;
         assert!(probe_handle.is_leader(), "every clone must see leader=true");
         assert!(internal_handle.is_leader());
         guard.step_down().await;
@@ -1961,7 +1996,7 @@ mod tests {
             .build();
         let probe = leader.state();
 
-        let guard = leader.acquire().await.expect("acquire must succeed");
+        let guard = acquire_ok(&leader).await;
         assert!(probe.is_leader());
         drop(guard);
         // Drop is synchronous; the state must be cleared by the time
@@ -2023,6 +2058,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guard_is_leader_requires_no_stepdown_reason() {
+        let server = MockServer::start().await;
+        let (_tx, rx) = watch::channel::<Option<StepDownReason>>(Some(StepDownReason::Cancelled));
+        let state = LeaderState::new();
+        state.set(true);
+        let guard = LeaderGuard {
+            client: mock_client(&server),
+            namespace: "test-ns".into(),
+            name: "my-lease".into(),
+            identity: "me".into(),
+            rx,
+            renew_handle: None,
+            state,
+        };
+
+        assert!(
+            !guard.is_leader(),
+            "a published stepdown reason must override LeaderState"
+        );
+    }
+
+    #[tokio::test]
     async fn leader_state_clears_before_lost_resolves() {
         // The headline guarantee: an HTTP `/readyz` handler reading
         // `LeaderState::is_leader()` must observe `false` BEFORE
@@ -2053,7 +2110,7 @@ mod tests {
             .renew_request_timeout(Duration::from_millis(50))
             .build();
         let probe = leader.state();
-        let mut guard = leader.acquire().await.expect("acquire must succeed");
+        let mut guard = acquire_ok(&leader).await;
         assert!(probe.is_leader());
 
         let reason = tokio::time::timeout(Duration::from_secs(2), guard.lost())
