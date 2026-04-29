@@ -24,7 +24,7 @@ your own `Cargo.toml`:
 
 ```toml
 [dependencies]
-kunobi-ha = { version = "0.4", features = ["v1_31"] }
+kunobi-ha = { version = "0.4.1", features = ["v1_31"] }
 ```
 
 Available proxy features: `v1_31`, `v1_32`, `v1_33`, `v1_34`, `v1_35`,
@@ -115,6 +115,73 @@ zero `retry_period`, empty identity/name/namespace) with
   generates a UUID. `Identity::Custom("…")` lets you pin a specific
   string. `&str` and `String` `Into<Identity>` automatically, so
   `.identity("foo")` still works.
+
+## Readiness gating
+
+Only the leader replica should accept user traffic from the
+Kubernetes service. The standard pattern is to gate `/readyz` on
+leader status — `kunobi-ha` exposes a clonable `LeaderState` handle
+so you don't have to roll your own `Arc<AtomicBool>`:
+
+```rust
+use kunobi_ha::leader::{LeaderElection, LeaderState};
+use std::sync::Arc;
+
+#[derive(Clone)]
+struct AppState { leader: LeaderState /* … */ }
+
+async fn readyz(state: AppState) -> http::StatusCode {
+    if state.leader.is_leader() {
+        http::StatusCode::OK
+    } else {
+        http::StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+# async fn run(client: kube::Client) -> kunobi_ha::Result<()> {
+let leader = LeaderElection::builder(client, "my-ns", "my-operator").build();
+let state  = leader.state();   // get the handle BEFORE blocking on acquire
+
+// Spawn the HTTP server first — `/readyz` returns 503 until acquire
+// succeeds. This is the bug that bit umami v0.3.13: spawning the
+// server AFTER `acquire().await` made the pod unreachable forever
+// when it wasn't the leader.
+let probe = state.clone();
+tokio::spawn(async move {
+    /* serve readyz with `probe` */
+    # let _ = probe;
+});
+
+let mut guard = leader.acquire().await?;   // state flips to true here
+// run reconcilers…
+guard.step_down().await;                   // state flips to false
+# Ok(()) }
+```
+
+The library guarantees that `LeaderState::is_leader()` flips to
+`false` BEFORE `guard.lost().await` resolves — kubelet sees the
+unready probe, removes the pod from service endpoints, and stops
+sending traffic before your shutdown handler runs.
+
+## Common pitfalls
+
+- **Spawning the HTTP server after `acquire()`.** Standby replicas
+  block forever on lease acquisition; nothing serves probes. Spawn
+  the server first with a `LeaderState` clone, then call
+  `acquire().await`.
+- **Hand-rolling the readiness flag.** A separate `Arc<AtomicBool>`
+  managed by user code can drift out of sync with the actual
+  lease — typically by forgetting to clear it on `lost()` or panic.
+  Use `LeaderState`; it's lifecycle-coupled to the renewal loop.
+- **Treating `lost()` as fatal.** It's a signal, not an error.
+  Inspect [`StepDownReason`]; e.g.
+  `RenewDeadlineExceeded` warrants a pod restart, but
+  `HolderChanged` just means another replica is now leader and you
+  should drain gracefully.
+- **Asking for too many RBAC verbs.** Only `get`, `create`, `update`
+  are needed (see [RBAC](#rbac) below). Granting `list`, `watch`,
+  `patch`, `delete` doesn't hurt the crate but violates
+  least-privilege.
 
 ## RBAC
 

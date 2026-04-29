@@ -8,10 +8,22 @@
 //!
 //! Run two copies in separate terminals to watch one stand by while the
 //! other holds the lease, then `Ctrl-C` the leader to see takeover.
+//!
+//! Demonstrates two things:
+//!
+//! 1. Spawning a "probe responder" task BEFORE blocking on
+//!    `leader.acquire().await`. In a real service this would be your
+//!    HTTP `/readyz` handler; here it's just a logger that prints
+//!    `is_leader()` every second. The point is that it must be alive
+//!    on standby replicas, not gated on becoming leader.
+//! 2. Reading [`LeaderState`] from the spawned task. The library owns
+//!    the timing — the flag flips to `true` synchronously with
+//!    `acquire()` returning, and back to `false` before
+//!    `guard.lost().await` resolves.
 
 use std::time::Duration;
 
-use kunobi_ha::leader::LeaderElection;
+use kunobi_ha::leader::{LeaderElection, LeaderState};
 use tokio::signal;
 use tracing::info;
 
@@ -30,6 +42,12 @@ async fn main() -> anyhow::Result<()> {
         .retry_period(Duration::from_secs(2))
         .build();
 
+    // Get the readiness handle BEFORE blocking on acquire so the
+    // probe task can run on standby replicas too. Real services
+    // would wire this into an axum/actix `/readyz` handler instead.
+    let probe_state: LeaderState = leader.state();
+    tokio::spawn(probe_loop(probe_state));
+
     info!("waiting for leader lease");
     let mut guard = leader.acquire().await?;
     info!("became leader");
@@ -46,4 +64,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Stand-in for an HTTP `/readyz` handler. In production this would
+/// translate `is_leader()` into a 200 / 503 response; here we just
+/// log the status so you can see the lifecycle in the test output.
+async fn probe_loop(state: LeaderState) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        interval.tick().await;
+        if state.is_leader() {
+            info!(ready = true, "probe: leader, /readyz would return 200");
+        } else {
+            info!(ready = false, "probe: standby, /readyz would return 503");
+        }
+    }
 }
