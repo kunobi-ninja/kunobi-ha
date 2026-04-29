@@ -242,8 +242,36 @@ pub struct LeaderElectionBuilder {
 impl LeaderElection {
     /// Start building a leader-election configuration.
     ///
-    /// `namespace` is where the Lease lives; `name` is the Lease name and
-    /// should be unique per controller (e.g. `"karakuri-operator"`).
+    /// - `client` is a [`kube::Client`] (typically obtained from
+    ///   `kube::Client::try_default().await?`).
+    /// - `namespace` is the Kubernetes namespace where the Lease
+    ///   object lives. Should be the operator's own namespace.
+    /// - `name` is the Lease object name and **must be unique per
+    ///   controller** running against the same Kubernetes cluster.
+    ///   Use a stable, descriptive name like `"my-operator"`; do not
+    ///   include per-replica information.
+    ///
+    /// Defaults applied by the builder match
+    /// `kube-controller-manager` / `kube-scheduler`:
+    ///
+    /// | parameter | default |
+    /// |---|---|
+    /// | `lease_duration` | 15s |
+    /// | `renew_deadline` | 10s |
+    /// | `retry_period` | 2s |
+    /// | `observe_timeout` | 5min |
+    /// | `renew_request_timeout` | 5s |
+    /// | `identity` | [`Identity::PodNameOrUuid`] |
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn run(client: kube::Client) -> kunobi_ha::Result<()> {
+    /// use kunobi_ha::leader::LeaderElection;
+    /// let leader = LeaderElection::builder(client, "kunobi-system", "my-operator")
+    ///     .build();
+    /// # let _ = leader; Ok(()) }
+    /// ```
     pub fn builder(
         client: Client,
         namespace: impl Into<String>,
@@ -274,44 +302,71 @@ impl LeaderElectionBuilder {
         self
     }
 
-    /// How long the lease is considered valid without renewal.
-    /// Default: 15s.
+    /// How long the lease is considered valid after the last
+    /// successful renewal. Followers treat the lease as expired and
+    /// up-for-grabs once `now > last_renew + lease_duration`.
+    ///
+    /// Default: 15s. Must be strictly greater than
+    /// [`renew_deadline`](Self::renew_deadline) — see the timing
+    /// model in the [module docs](self).
     pub fn lease_duration(mut self, duration: Duration) -> Self {
         self.lease_duration = duration;
         self
     }
 
-    /// Deadline within which the leader must successfully renew. If the
-    /// leader cannot renew by this time it steps down.
-    /// Default: 10s (2/3 of `lease_duration`).
+    /// Deadline within which the leader must successfully renew the
+    /// Lease. If the leader cannot renew by this time it steps down
+    /// with [`StepDownReason::RenewDeadlineExceeded`].
+    ///
+    /// Default: 10s (2/3 of `lease_duration` per the Kubernetes
+    /// reference). Must be strictly less than
+    /// [`lease_duration`](Self::lease_duration); the gap gives a
+    /// departing leader a grace window to notice loss and step down
+    /// before any follower can legitimately claim the lease.
     pub fn renew_deadline(mut self, duration: Duration) -> Self {
         self.renew_deadline = duration;
         self
     }
 
-    /// How often the leader attempts renewal and followers poll.
-    /// Default: 2s.
+    /// Cadence for the leader's renewal attempts and the follower's
+    /// poll loop. The first follower to poll after a leader stepped
+    /// down (or had its TTL expire) takes over the lease.
+    ///
+    /// Default: 2s. Must be `<= renew_deadline` and `> 0`.
     pub fn retry_period(mut self, duration: Duration) -> Self {
         self.retry_period = duration;
         self
     }
 
-    /// If the API is unreachable for this long during the initial acquire
-    /// loop, give up and return an error.
-    /// Default: 5 minutes.
+    /// Maximum time the *initial-acquire* loop will tolerate sustained
+    /// API errors before bailing out with [`Error::ObserveTimeout`].
+    /// Distinct from [`renew_deadline`](Self::renew_deadline), which
+    /// applies once we already hold the lease.
+    ///
+    /// Default: 5 minutes. Treat the resulting error as fatal —
+    /// kubelet will restart the pod and we'll retry from scratch.
     pub fn observe_timeout(mut self, duration: Duration) -> Self {
         self.observe_timeout = duration;
         self
     }
 
-    /// Per-request timeout for renewal calls.
+    /// Per-renewal-request timeout (covers a single GET + PUT cycle
+    /// during the renew loop). Independent of
+    /// [`renew_deadline`](Self::renew_deadline), which is the
+    /// cumulative budget across multiple failed renewal attempts.
+    ///
     /// Default: 5s.
     pub fn renew_request_timeout(mut self, duration: Duration) -> Self {
         self.renew_request_timeout = duration;
         self
     }
 
-    /// Finalise the configuration.
+    /// Finalise the configuration into a [`LeaderElection`].
+    ///
+    /// The returned value can be used to:
+    /// - obtain a [`LeaderState`] handle via
+    ///   [`LeaderElection::state`] before blocking on acquisition;
+    /// - block on the lease via [`LeaderElection::acquire`].
     pub fn build(self) -> LeaderElection {
         let identity = self.identity.unwrap_or_default().resolve();
         LeaderElection {
@@ -342,13 +397,44 @@ impl LeaderElection {
         self.state.clone()
     }
 
-    /// Block until this instance acquires the lease, then return a guard
-    /// that keeps the lease renewed in the background.
+    /// Block until this instance acquires the lease, then return a
+    /// guard that keeps the lease renewed in the background.
     ///
-    /// The returned [`LeaderGuard`] should be held for the lifetime of the
-    /// controllers. Call [`LeaderGuard::lost`] to wait for step-down
-    /// events (lost renewal), and [`LeaderGuard::step_down`] in your
+    /// The returned [`LeaderGuard`] should be held for the lifetime
+    /// of the controllers. Call [`LeaderGuard::lost`] to wait for
+    /// step-down events, and [`LeaderGuard::step_down`] in your
     /// shutdown path to relinquish the lease cooperatively.
+    ///
+    /// On success, any clone of the [`LeaderState`] handle obtained
+    /// via [`Self::state`] flips to `is_leader() == true`
+    /// synchronously with this future resolving.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidConfig`] — the durations or
+    ///   identity/name/namespace strings violate an invariant of the
+    ///   algorithm. Returned synchronously, before any API call.
+    /// - [`Error::ObserveTimeout`] — the Kubernetes API has been
+    ///   unreachable (or returning errors) for more than
+    ///   `observe_timeout` while we tried to acquire. Treat as fatal:
+    ///   exit so kubelet restarts the pod.
+    /// - [`Error::Kube`] is **not** returned during acquisition —
+    ///   transient API errors are folded into the retry loop and
+    ///   only surface as `ObserveTimeout` if they persist.
+    /// - [`Error::Timestamp`] — the system clock produced a value
+    ///   that doesn't fit `k8s_openapi::jiff::Timestamp`. Should be
+    ///   unreachable in practice (would require a clock skew of
+    ///   centuries).
+    ///
+    /// # Cancel safety
+    ///
+    /// This future is **not** cancel-safe. Dropping the future mid-
+    /// execution is fine for resource cleanup (no leak), but if a
+    /// transient acquire/replace request was in flight at the moment
+    /// of cancellation, the holder identity on the Lease may be set
+    /// to ours even though no [`LeaderGuard`] is returned. The next
+    /// acquire attempt's renew/takeover path handles that correctly
+    /// (we recognise our own identity and renew rather than create).
     pub async fn acquire(&self) -> Result<LeaderGuard> {
         self.validate()?;
 
@@ -508,13 +594,38 @@ impl LeaderGuard {
     ///
     /// Resolves once the renewal task has signalled stepdown for any
     /// of the cases enumerated by [`StepDownReason`]. Returns
-    /// immediately on subsequent calls — safe to use in
-    /// `tokio::select!` alongside your controller futures.
+    /// immediately on subsequent calls — idempotent — so it is safe
+    /// to use in `tokio::select!` alongside your controller futures.
     ///
     /// The shared [`LeaderState`] handle is flipped to
-    /// `is_leader() == false` BEFORE this resolves, so any HTTP
-    /// `/readyz` probe gated on that state will see "not ready"
+    /// `is_leader() == false` **before** this resolves, so any HTTP
+    /// `/readyz` probe gated on that state reports "not ready"
     /// before the user-level shutdown handler runs.
+    ///
+    /// # Cancel safety
+    ///
+    /// This future is cancel-safe. Dropping it has no effect on the
+    /// underlying renewal task or the [`LeaderState`] handle.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn run(client: kube::Client) -> kunobi_ha::Result<()> {
+    /// # use kunobi_ha::leader::{LeaderElection, StepDownReason};
+    /// # let leader = LeaderElection::builder(client, "ns", "lease").build();
+    /// # let mut guard = leader.acquire().await?;
+    /// # async fn run_controllers() {}
+    /// tokio::select! {
+    ///     reason = guard.lost() => match reason {
+    ///         StepDownReason::RenewDeadlineExceeded => { /* exit pod */ }
+    ///         StepDownReason::HolderChanged       => { /* drain */ }
+    ///         StepDownReason::Cancelled           => { /* user-driven */ }
+    ///         _ => {}
+    ///     },
+    ///     _ = run_controllers() => {}
+    /// }
+    /// # Ok(()) }
+    /// ```
     pub async fn lost(&mut self) -> StepDownReason {
         loop {
             if let Some(reason) = self.rx.borrow().clone() {
@@ -532,16 +643,44 @@ impl LeaderGuard {
     }
 
     /// `true` while we still hold the lease.
+    ///
+    /// Equivalent to checking that [`Self::lost`] has not yet
+    /// resolved. Cheap (one watch borrow + atomic compare); safe to
+    /// poll from a hot path.
+    ///
+    /// For sharing the leader status with HTTP probes / metrics,
+    /// prefer cloning a [`LeaderState`] handle obtained from
+    /// [`LeaderElection::state`] — it doesn't require borrowing the
+    /// guard.
     pub fn is_leader(&self) -> bool {
         self.rx.borrow().is_none()
     }
 
-    /// Cooperatively relinquish the lease — PATCH the Lease to clear our
-    /// holder identity and abort the renewal task. The next replica
-    /// notices immediately and takes over (within `retry_period`, not
-    /// `lease_duration`).
+    /// Cooperatively relinquish the lease.
     ///
-    /// Safe to call multiple times. No-op if we've already stepped down.
+    /// Performs three steps, in order:
+    ///
+    /// 1. Flips the shared [`LeaderState`] to `is_leader() == false`
+    ///    (synchronously, before any I/O).
+    /// 2. Aborts the renewal task.
+    /// 3. Best-effort PUT to clear `holder_identity` on the Lease
+    ///    object. The next replica's polling loop sees the cleared
+    ///    holder on its next tick and takes over within
+    ///    `retry_period` instead of waiting for the full
+    ///    `lease_duration` TTL. If the PUT fails (network blip
+    ///    during shutdown is common), the lease still expires on its
+    ///    own — recovery just takes longer.
+    ///
+    /// Consumes `self`. There is no way to resume the lease after
+    /// stepping down — call [`LeaderElection::acquire`] again to
+    /// re-elect.
+    ///
+    /// # Cancel safety
+    ///
+    /// **Not cancel-safe.** If this future is cancelled mid-PUT, the
+    /// holder may not have been cleared on the API server even
+    /// though the renewal task was aborted. The next replica still
+    /// takes over, just on TTL expiry rather than immediately.
     pub async fn step_down(mut self) {
         self.step_down_inner().await;
     }

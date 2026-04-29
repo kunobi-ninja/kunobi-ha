@@ -1,30 +1,57 @@
-//! Error types.
+//! Error types returned by leader-election operations.
+//!
+//! [`Error`] is the top-level enum every fallible API in this crate
+//! returns. Specific configuration-validation failures are nested
+//! inside [`Error::InvalidConfig`] as [`InvalidConfig`] variants —
+//! callers that want to react to specific misconfigurations match
+//! through the wrapper rather than parsing the [`Display`] string.
+//!
+//! [`Display`]: std::fmt::Display
 
 use std::time::Duration;
 
 /// Error returned by leader-election operations.
+///
+/// Marked `#[non_exhaustive]` — match through with a wildcard arm
+/// to keep your code compatible with future minor releases.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// Wrapping a `kube` API error.
+    /// A request to the Kubernetes API failed in a way the renew loop
+    /// or initial-acquire loop did not handle internally.
+    ///
+    /// During the initial-acquire loop, transient [`kube::Error`]s
+    /// are folded into the retry path and only surface as
+    /// [`Error::ObserveTimeout`] if they persist. After acquisition,
+    /// most renewal errors are also retried within `renew_deadline`;
+    /// see [`LeaderGuard::lost`][crate::leader::LeaderGuard::lost]
+    /// for the runtime path.
     #[error("kubernetes api error: {0}")]
     Kube(#[from] kube::Error),
 
-    /// Wrapping timestamp conversion errors from `k8s_openapi::jiff`.
+    /// The system clock produced a value that doesn't fit
+    /// `k8s_openapi::jiff::Timestamp`. Should be unreachable in
+    /// practice — would require a clock skew of centuries.
     #[error("timestamp conversion: {0}")]
     Timestamp(String),
 
-    /// Could not observe or acquire the lease within the configured deadline.
+    /// The Kubernetes API stayed unreachable for longer than
+    /// `observe_timeout` while [`LeaderElection::acquire`][crate::leader::LeaderElection::acquire]
+    /// was looping.
     ///
-    /// Typically means the Kubernetes API is unreachable for a prolonged
-    /// period — the caller should treat this as fatal and exit so the pod
-    /// restarts.
+    /// Treat this as fatal: exit so kubelet restarts the pod and the
+    /// acquisition retries from scratch. The boxed inner [`Error`]
+    /// is the most recent transient error encountered.
     #[error("failed to observe or acquire leader lease within {0:?}: {1}")]
     ObserveTimeout(Duration, Box<Error>),
 
-    /// The configuration handed to [`LeaderElection::acquire`][crate::leader::LeaderElection::acquire]
-    /// violates an invariant of the algorithm. The contained
-    /// [`InvalidConfig`] value identifies which one.
+    /// Configuration handed to [`LeaderElection::acquire`][crate::leader::LeaderElection::acquire]
+    /// violates an invariant of the algorithm. Returned synchronously
+    /// from `acquire().await` before any API call.
+    ///
+    /// The wrapped [`InvalidConfig`] value identifies the specific
+    /// invariant and carries the offending values so callers can
+    /// produce typed diagnostics.
     #[error("invalid leader-election config: {0}")]
     InvalidConfig(#[from] InvalidConfig),
 }
