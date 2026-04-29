@@ -33,7 +33,9 @@
 //! # }
 //! ```
 //!
-//! See [`leader`] for the full API.
+//! See [`leader`] for the full API. [`LeaderState`] is the clonable
+//! handle for gating `/readyz` probes on leader status — see the
+//! README's "Readiness gating" section.
 
 #![warn(missing_docs)]
 // Pedantic lints are valuable but too noisy as hard errors for a small
