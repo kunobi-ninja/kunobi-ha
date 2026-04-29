@@ -44,3 +44,4 @@ pub mod error;
 pub mod leader;
 
 pub use error::{Error, InvalidConfig, Result};
+pub use leader::LeaderState;

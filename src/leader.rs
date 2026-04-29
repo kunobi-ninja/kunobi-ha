@@ -59,6 +59,8 @@
 //! departing leader a grace window to notice loss and step down before any
 //! follower could legitimately claim the lease.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
@@ -134,6 +136,80 @@ impl From<String> for Identity {
     }
 }
 
+/// Cheaply clonable, thread-safe handle to the current leader status.
+///
+/// Use this to gate a `/readyz` probe (or anything else that should
+/// only be true on the leader replica) without rolling your own
+/// `Arc<AtomicBool>`.
+///
+/// Obtain via [`LeaderElection::state`] before calling `acquire()` so
+/// you can spawn your HTTP server BEFORE blocking on lease
+/// acquisition.
+///
+/// # Lifecycle
+///
+/// The library guarantees, under sequential consistency:
+///
+/// - Returns `false` until [`LeaderElection::acquire`] resolves
+///   `Ok(guard)`. The flip to `true` happens before `acquire()`
+///   returns.
+/// - Flips back to `false` **before** [`LeaderGuard::lost`] resolves
+///   with a [`StepDownReason`] (so `/readyz` reports unready before
+///   the user-level shutdown handler runs).
+/// - Flips to `false` synchronously when [`LeaderGuard::step_down`] is
+///   called or the [`LeaderGuard`] is dropped.
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn run(client: kube::Client) -> kunobi_ha::Result<()> {
+/// use kunobi_ha::leader::LeaderElection;
+///
+/// let leader = LeaderElection::builder(client, "my-ns", "my-operator").build();
+/// let state = leader.state();
+///
+/// // Spawn the HTTP server BEFORE blocking on the lease — `/readyz`
+/// // will return 503 until acquire() succeeds.
+/// let probe_state = state.clone();
+/// tokio::spawn(async move {
+///     // axum / actix / hyper handler reads `probe_state.is_leader()`
+///     // and replies 200 / 503.
+///     # let _ = probe_state;
+/// });
+///
+/// let mut guard = leader.acquire().await?;
+/// assert!(state.is_leader());
+/// // Run your reconcilers...
+/// guard.step_down().await;
+/// assert!(!state.is_leader());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Debug)]
+pub struct LeaderState {
+    inner: Arc<AtomicBool>,
+}
+
+impl LeaderState {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// `true` while this replica currently holds the leader lease.
+    ///
+    /// Cheap (one atomic load); safe to call from any thread, any
+    /// number of times.
+    pub fn is_leader(&self) -> bool {
+        self.inner.load(Ordering::Acquire)
+    }
+
+    fn set(&self, leader: bool) {
+        self.inner.store(leader, Ordering::Release);
+    }
+}
+
 /// Configure and start a leader election loop.
 #[non_exhaustive]
 pub struct LeaderElection {
@@ -146,6 +222,7 @@ pub struct LeaderElection {
     retry_period: Duration,
     observe_timeout: Duration,
     renew_request_timeout: Duration,
+    state: LeaderState,
 }
 
 /// Fluent builder returned by [`LeaderElection::builder`].
@@ -247,11 +324,24 @@ impl LeaderElectionBuilder {
             retry_period: self.retry_period,
             observe_timeout: self.observe_timeout,
             renew_request_timeout: self.renew_request_timeout,
+            state: LeaderState::new(),
         }
     }
 }
 
 impl LeaderElection {
+    /// Returns a clonable handle to this instance's leader status.
+    ///
+    /// Cheap to call (clones an `Arc`). Safe to call before
+    /// [`acquire`](Self::acquire) — the handle starts as
+    /// `is_leader() == false` and flips to `true` when acquire
+    /// succeeds.
+    ///
+    /// See [`LeaderState`] for the full lifecycle contract.
+    pub fn state(&self) -> LeaderState {
+        self.state.clone()
+    }
+
     /// Block until this instance acquires the lease, then return a guard
     /// that keeps the lease renewed in the background.
     ///
@@ -289,6 +379,12 @@ impl LeaderElection {
             }
         }
 
+        // Flip leader-state to `true` BEFORE returning the guard, so
+        // any clone of `self.state()` already held by the caller (e.g.
+        // an HTTP server's `/readyz` handler) sees us as ready
+        // synchronously with `acquire().await` resolving.
+        self.state.set(true);
+
         let (tx, rx) = watch::channel::<Option<StepDownReason>>(None);
         let handle = tokio::spawn({
             let client = self.client.clone();
@@ -299,6 +395,7 @@ impl LeaderElection {
             let renew_deadline = self.renew_deadline;
             let lease_duration = self.lease_duration;
             let renew_request_timeout = self.renew_request_timeout;
+            let state = self.state.clone();
             async move {
                 renew_loop(
                     client,
@@ -309,6 +406,7 @@ impl LeaderElection {
                     retry_period,
                     renew_deadline,
                     renew_request_timeout,
+                    state,
                     tx,
                 )
                 .await;
@@ -322,6 +420,7 @@ impl LeaderElection {
             identity: self.identity.clone(),
             rx,
             renew_handle: Some(handle),
+            state: self.state.clone(),
         })
     }
 
@@ -400,6 +499,7 @@ pub struct LeaderGuard {
     identity: String,
     rx: watch::Receiver<Option<StepDownReason>>,
     renew_handle: Option<tokio::task::JoinHandle<()>>,
+    state: LeaderState,
 }
 
 impl LeaderGuard {
@@ -410,6 +510,11 @@ impl LeaderGuard {
     /// of the cases enumerated by [`StepDownReason`]. Returns
     /// immediately on subsequent calls — safe to use in
     /// `tokio::select!` alongside your controller futures.
+    ///
+    /// The shared [`LeaderState`] handle is flipped to
+    /// `is_leader() == false` BEFORE this resolves, so any HTTP
+    /// `/readyz` probe gated on that state will see "not ready"
+    /// before the user-level shutdown handler runs.
     pub async fn lost(&mut self) -> StepDownReason {
         loop {
             if let Some(reason) = self.rx.borrow().clone() {
@@ -419,7 +524,8 @@ impl LeaderGuard {
                 // All senders dropped without writing a reason — the
                 // renewal task was aborted (step_down / Drop) or it
                 // panicked. From the caller's perspective, we're no
-                // longer leader.
+                // longer leader, and the state handle has already
+                // been cleared by step_down_inner / Drop.
                 return StepDownReason::Cancelled;
             }
         }
@@ -442,6 +548,10 @@ impl LeaderGuard {
 
     async fn step_down_inner(&mut self) {
         if let Some(handle) = self.renew_handle.take() {
+            // Flip the shared LeaderState BEFORE we abort and PUT, so
+            // any HTTP `/readyz` handler sees "not ready" while the
+            // cooperative-release request is still in flight.
+            self.state.set(false);
             handle.abort();
             // Best-effort clear of holder_identity so the next replica
             // doesn't have to wait for the TTL. Any error is logged and
@@ -462,8 +572,11 @@ impl LeaderGuard {
 impl Drop for LeaderGuard {
     fn drop(&mut self) {
         // On drop without explicit step_down (e.g. on panic), just abort
-        // the renew loop. Letting the TTL expire is the safe fallback.
+        // the renew loop and clear the shared state. Letting the TTL
+        // expire is the safe fallback for the lease itself; the state
+        // handle clears synchronously so probes update immediately.
         if let Some(handle) = self.renew_handle.take() {
+            self.state.set(false);
             handle.abort();
         }
     }
@@ -687,6 +800,7 @@ async fn renew_loop(
     retry_period: Duration,
     renew_deadline: Duration,
     renew_request_timeout: Duration,
+    state: LeaderState,
     tx: watch::Sender<Option<StepDownReason>>,
 ) {
     let leases: Api<Lease> = Api::namespaced(client, namespace);
@@ -697,6 +811,15 @@ async fn renew_loop(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let mut last_renew = tokio::time::Instant::now();
+
+    // Helper: clear shared state BEFORE we publish the StepDownReason,
+    // so any HTTP `/readyz` probe gated on `LeaderState::is_leader()`
+    // sees the false transition before `LeaderGuard::lost().await`
+    // resolves with the reason.
+    let stepdown = |reason: StepDownReason| {
+        state.set(false);
+        let _ = tx.send(Some(reason));
+    };
 
     loop {
         interval.tick().await;
@@ -712,7 +835,7 @@ async fn renew_loop(
             }
             Ok(Ok(RenewOutcome::Lost)) => {
                 warn!("lost leader lease — stepping down");
-                let _ = tx.send(Some(StepDownReason::HolderChanged));
+                stepdown(StepDownReason::HolderChanged);
                 return;
             }
             Ok(Err(e)) => {
@@ -723,7 +846,7 @@ async fn renew_loop(
                         "renew deadline exceeded — stepping down after {:?} since last success",
                         renew_deadline
                     );
-                    let _ = tx.send(Some(StepDownReason::RenewDeadlineExceeded));
+                    stepdown(StepDownReason::RenewDeadlineExceeded);
                     return;
                 }
             }
@@ -735,7 +858,7 @@ async fn renew_loop(
                         "renew deadline exceeded — stepping down after {:?} since last success",
                         renew_deadline
                     );
-                    let _ = tx.send(Some(StepDownReason::RenewDeadlineExceeded));
+                    stepdown(StepDownReason::RenewDeadlineExceeded);
                     return;
                 }
             }
@@ -1500,6 +1623,121 @@ mod tests {
     #[test]
     fn identity_default_is_pod_name_or_uuid() {
         assert!(matches!(Identity::default(), Identity::PodNameOrUuid));
+    }
+
+    // -----------------------------------------------------------------------
+    // LeaderState lifecycle invariants
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn leader_state_starts_false_before_acquire() {
+        let server = MockServer::start().await;
+        let leader = LeaderElection::builder(mock_client(&server), "test-ns", "my-lease")
+            .identity("me")
+            .build();
+        assert!(!leader.state().is_leader());
+    }
+
+    #[tokio::test]
+    async fn leader_state_clones_share_underlying_state() {
+        // The clonable handle's contract: every clone observes the
+        // same atomic. Without this, gating /readyz from a copy held
+        // by an HTTP server doesn't work.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_held_by("me")))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_held_by("me")))
+            .mount(&server)
+            .await;
+
+        let leader = LeaderElection::builder(mock_client(&server), "test-ns", "my-lease")
+            .identity("me")
+            .build();
+        let probe_handle = leader.state();
+        let internal_handle = leader.state();
+        assert!(!probe_handle.is_leader());
+        assert!(!internal_handle.is_leader());
+
+        let guard = leader.acquire().await.expect("acquire must succeed");
+        assert!(probe_handle.is_leader(), "every clone must see leader=true");
+        assert!(internal_handle.is_leader());
+        guard.step_down().await;
+        assert!(
+            !probe_handle.is_leader(),
+            "every clone must see leader=false after step_down"
+        );
+    }
+
+    #[tokio::test]
+    async fn leader_state_clears_on_guard_drop() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_held_by("me")))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_held_by("me")))
+            .mount(&server)
+            .await;
+
+        let leader = LeaderElection::builder(mock_client(&server), "test-ns", "my-lease")
+            .identity("me")
+            .build();
+        let probe = leader.state();
+
+        let guard = leader.acquire().await.expect("acquire must succeed");
+        assert!(probe.is_leader());
+        drop(guard);
+        // Drop is synchronous; the state must be cleared by the time
+        // the line above returns control.
+        assert!(!probe.is_leader(), "Drop must clear shared LeaderState");
+    }
+
+    #[tokio::test]
+    async fn leader_state_clears_before_lost_resolves() {
+        // The headline guarantee: an HTTP `/readyz` handler reading
+        // `LeaderState::is_leader()` must observe `false` BEFORE
+        // user-level code awaiting `lost()` runs. Otherwise the user
+        // sees "we lost the lease" but probes still answer 200,
+        // sending traffic to a non-leader for the brief window
+        // between renew_loop's signal and the user's shutdown handler.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_held_by("me")))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_held_by("other")))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_held_by("me")))
+            .mount(&server)
+            .await;
+
+        let leader = LeaderElection::builder(mock_client(&server), "test-ns", "my-lease")
+            .identity("me")
+            .lease_duration(Duration::from_millis(200))
+            .renew_deadline(Duration::from_millis(100))
+            .retry_period(Duration::from_millis(20))
+            .renew_request_timeout(Duration::from_millis(50))
+            .build();
+        let probe = leader.state();
+        let mut guard = leader.acquire().await.expect("acquire must succeed");
+        assert!(probe.is_leader());
+
+        let reason = tokio::time::timeout(Duration::from_secs(2), guard.lost())
+            .await
+            .expect("lost() must fire when renew sees a different holder");
+        assert_eq!(reason, StepDownReason::HolderChanged);
+        assert!(
+            !probe.is_leader(),
+            "LeaderState must be cleared BEFORE lost() resolves"
+        );
     }
 
     // -----------------------------------------------------------------------
