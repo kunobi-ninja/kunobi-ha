@@ -38,6 +38,20 @@ Available proxy features: `v1_31`, `v1_32`, `v1_33`, `v1_34`, `v1_35`,
 needs to support. If you already depend on `k8s-openapi` directly with
 a `v1_xx` feature enabled, you don't need a proxy feature here.
 
+### TLS
+
+`kunobi-ha` depends on `kube` with `default-features = false` — a
+library must not pick the TLS backend for the final binary. Your
+binary constructs the `kube::Client`, so **your** `Cargo.toml` must
+enable a TLS feature on `kube`:
+
+```toml
+kube = { version = "3", features = ["client", "rustls-tls"] }
+```
+
+Without it the code still compiles, but `kube::Client::try_default()`
+fails at runtime with `TLS required but no TLS stack selected`.
+
 ## Leader election
 
 ```rust
@@ -188,6 +202,12 @@ sending traffic before your shutdown handler runs.
   are needed (see [RBAC](#rbac) below). Granting `list`, `watch`,
   `patch`, `delete` doesn't hurt the crate but violates
   least-privilege.
+- **Scoping `create` with `resourceNames`.** A rule that sets
+  `resourceNames` does not authorize `create` — the Lease has no name
+  at authorization time, so the API server returns `403 ... cannot
+  create resource "leases"` and leader election never bootstraps.
+  `create` needs its own rule with no `resourceNames`; see
+  [RBAC](#rbac).
 
 ## RBAC
 
@@ -198,11 +218,24 @@ step-down all use PUT):
 
 ```yaml
 rules:
+  # `create` cannot be restricted by resourceNames — at authorization
+  # time the Lease has no name yet, so a resourceNames-scoped rule
+  # never authorizes it. It must be its own rule.
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
-    resourceNames: [my-operator]   # optional: tighten to the lease(s) you own
-    verbs: [get, create, update]
+    verbs: [create]
+  # `get` / `update` can be tightened to the lease(s) you own.
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [my-operator]
+    verbs: [get, update]
 ```
+
+Do **not** collapse this into one rule with `resourceNames` and
+`verbs: [get, create, update]`. Kubernetes RBAC cannot match a
+`resourceName` on a `create` — the object has no name until the
+request succeeds — so the API server returns `403 ... cannot create
+resource "leases"` and leader election can never bootstrap the Lease.
 
 `list`, `watch`, `patch`, `delete` are **not** required. If your
 ServiceAccount already has them for other reasons that's fine, but
