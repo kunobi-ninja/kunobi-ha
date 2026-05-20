@@ -27,10 +27,10 @@ jobs:
       image: rust:1.94.1-bookworm
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           # `~/.cargo/bin` caches installed tools so cargo-deny doesn't
           # recompile every run. Splitting registry into index/cache
@@ -84,7 +84,7 @@ jobs:
 
       - name: Upload coverage report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: coverage/tarpaulin-report.json
@@ -104,9 +104,9 @@ jobs:
       image: rust:1.94.1-bookworm
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/bin
