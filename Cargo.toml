@@ -28,7 +28,7 @@ latest = ["k8s-openapi/latest"]
 # proxy features above) to pick `v1_xx`, so there is only one version
 # across the dependency tree. `dev-dependencies` below enable `latest` so
 # our own tests can run standalone.
-kube = { version = "3", features = ["client"], default-features = false }
+kube = { version = "4", features = ["client"], default-features = false }
 k8s-openapi = "0.27"
 
 # Async
