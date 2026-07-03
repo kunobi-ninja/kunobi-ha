@@ -60,10 +60,10 @@ jobs:
       # builds the lib without dev-dependencies, so it's the only place
       # that catches an accidental version pin in `[dependencies]`.
       # We deliberately do NOT use `--all-features` here: the version
-      # proxy features (`v1_31` … `latest`) are mutually exclusive on
+      # proxy features (`v1_32` … `latest`) are mutually exclusive on
       # k8s-openapi, and enabling them all at once is a build error.
       - name: Build lib (minimum supported version)
-        run: cargo build --lib --features v1_31
+        run: cargo build --lib --features v1_32
 
       - name: Build lib (latest)
         run: cargo build --lib --features latest

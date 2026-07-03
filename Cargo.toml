@@ -12,14 +12,14 @@ categories = ["asynchronous", "web-programming"]
 [features]
 # Proxy features to k8s-openapi so a downstream binary can pick its
 # Kubernetes API version through this crate's surface (e.g.
-# `kunobi-ha = { version = "0.1", features = ["v1_31"] }`) instead of
+# `kunobi-ha = { version = "0.1", features = ["v1_32"] }`) instead of
 # also adding k8s-openapi as a direct dependency. Library consumers
 # MUST NOT enable any of these — leave the choice to the final binary.
-v1_31 = ["k8s-openapi/v1_31"]
 v1_32 = ["k8s-openapi/v1_32"]
 v1_33 = ["k8s-openapi/v1_33"]
 v1_34 = ["k8s-openapi/v1_34"]
 v1_35 = ["k8s-openapi/v1_35"]
+v1_36 = ["k8s-openapi/v1_36"]
 latest = ["k8s-openapi/latest"]
 
 [dependencies]
@@ -28,8 +28,8 @@ latest = ["k8s-openapi/latest"]
 # proxy features above) to pick `v1_xx`, so there is only one version
 # across the dependency tree. `dev-dependencies` below enable `latest` so
 # our own tests can run standalone.
-kube = { version = "3", features = ["client"], default-features = false }
-k8s-openapi = "0.27"
+kube = { version = "4", features = ["client"], default-features = false }
+k8s-openapi = "0.28"
 
 # Async
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
@@ -63,7 +63,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 proptest = "1"
 # Pick a k8s-openapi version so our own tests can build. Binary consumers
 # of kunobi-ha must activate their own `v1_xx` feature instead.
-k8s-openapi = { version = "0.27", features = ["latest"] }
+k8s-openapi = { version = "0.28", features = ["latest"] }
 
 [[example]]
 name = "leader"
