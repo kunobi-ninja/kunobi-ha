@@ -2,8 +2,8 @@
 
 [![Crates.io](https://img.shields.io/crates/v/kunobi-ha.svg)](https://crates.io/crates/kunobi-ha)
 [![Docs.rs](https://img.shields.io/docsrs/kunobi-ha)](https://docs.rs/kunobi-ha)
-[![CI](https://github.com/kunobi-ninja/kunobi-ha/actions/workflows/ci.yml/badge.svg)](https://github.com/kunobi-ninja/kunobi-ha/actions/workflows/ci.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![CI](https://github.com/kunobi-ninja/kunobi-ha/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kunobi-ninja/kunobi-ha/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.94.1-blue.svg)](Cargo.toml)
 
 Building blocks for high-availability Kubernetes controllers written in Rust.
