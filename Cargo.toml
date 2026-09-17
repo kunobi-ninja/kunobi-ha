@@ -8,6 +8,9 @@ description = "Building blocks for high-availability Kubernetes controllers — 
 repository = "https://github.com/kunobi-ninja/kunobi-ha"
 keywords = ["kubernetes", "leader-election", "lease", "controller", "operator"]
 categories = ["asynchronous", "web-programming"]
+readme = "README.md"
+# Publish only what builds the library. Examples, CI and tooling stay in the repository.
+include = ["/src/**/*.rs", "/README.md", "/LICENSE"]
 
 [features]
 # Proxy features to k8s-openapi so a downstream binary can pick its

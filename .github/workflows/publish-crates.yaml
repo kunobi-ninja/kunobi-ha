@@ -1,0 +1,94 @@
+name: Publish crate
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish kunobi-ha to crates.io
+    runs-on: ubuntu-latest
+    # crates.io OIDC Trusted Publishing: GitHub mints a short-lived OIDC token
+    # (id-token: write), `rust-lang/crates-io-auth-action` exchanges it for a
+    # scoped crates.io token, and `cargo publish` uses it, so there is no
+    # long-lived CARGO_REGISTRY_TOKEN secret. crates.io only accepts a Trusted
+    # Publisher for a crate that already exists: publish the first version by
+    # hand, then configure this repository and workflow file on crates.io.
+    #
+    # If the crates.io Trusted Publisher config pins a GitHub Environment, add
+    # the matching `environment: <name>` here. The workflow file name and any
+    # environment must stay in sync with crates.io's trusted-publisher claims.
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      CARGO_TERM_COLOR: always
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      # The toolchain pinned in .mise.toml, the same one CI tests with.
+      - name: Install mise tools
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          install_args: rust
+
+      - name: Check release tag matches Cargo manifest version
+        # The version gate: the release tag (`vX.Y.Z`, prerelease suffix
+        # included) must equal the `version` in Cargo.toml. Hermetic (pure
+        # manifest read) and fail-closed, so crates.io only ever gets the exact
+        # manifest version the tag was checked against.
+        run: |
+          version="${RELEASE_TAG#v}"
+          manifest_version="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          if [ "$manifest_version" != "$version" ]; then
+            echo "Cargo.toml version $manifest_version does not match release tag $RELEASE_TAG" >&2
+            exit 1
+          fi
+          echo "Release tag $RELEASE_TAG matches Cargo.toml version $manifest_version"
+
+      # `latest` is only for the verification build: k8s-openapi panics unless a
+      # v1_* feature is picked, and features are not baked into the published crate.
+      - name: Package kunobi-ha
+        run: cargo package -p kunobi-ha --locked --features latest
+
+      # Checked before authenticating, so re-running a release, or releasing a version
+      # that was published by hand (like the first one), passes without a token.
+      - name: Check whether this version is already on crates.io
+        id: published
+        run: |
+          version="${RELEASE_TAG#v}"
+          status="$(curl -sS -A kunobi-ha-publish-workflow -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/kunobi-ha/$version")"
+          case "$status" in
+            200)
+              echo "kunobi-ha $version is already published; nothing to do"
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "unexpected crates.io status while checking kunobi-ha $version: $status" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Authenticate to crates.io
+        if: steps.published.outputs.exists == 'false'
+        id: auth
+        # v1.0.4 is the first release on the Node 24 runtime; the floating @v1
+        # tag still runs on the deprecated Node 20 runtime.
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish kunobi-ha
+        if: steps.published.outputs.exists == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish -p kunobi-ha --locked --features latest
