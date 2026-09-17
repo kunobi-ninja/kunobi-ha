@@ -867,7 +867,7 @@ dependencies = [
 
 [[package]]
 name = "kunobi-ha"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
