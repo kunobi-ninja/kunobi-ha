@@ -30,10 +30,10 @@ your own `Cargo.toml`:
 
 ```toml
 [dependencies]
-kunobi-ha = { version = "0.5.0", features = ["v1_31"] }
+kunobi-ha = { version = "0.6.1", features = ["v1_32"] }
 ```
 
-Available proxy features: `v1_31`, `v1_32`, `v1_33`, `v1_34`, `v1_35`,
+Available proxy features: `v1_32`, `v1_33`, `v1_34`, `v1_35`, `v1_36`,
 `latest`. Pick the **minimum** Kubernetes API version your operator
 needs to support. If you already depend on `k8s-openapi` directly with
 a `v1_xx` feature enabled, you don't need a proxy feature here.

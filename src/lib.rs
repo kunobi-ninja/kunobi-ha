@@ -62,14 +62,14 @@
 //! `k8s-openapi`'s flags as proxy features so consumers can pin a
 //! version through `kunobi-ha` alone:
 //!
-//! - `v1_31`, `v1_32`, `v1_33`, `v1_34`, `v1_35`
-//! - `latest` (currently aliased to `v1_35`; tracks `k8s-openapi/latest`)
+//! - `v1_32`, `v1_33`, `v1_34`, `v1_35`, `v1_36`
+//! - `latest` (currently aliased to `v1_36`; tracks `k8s-openapi/latest`)
 //!
 //! Pick the **minimum** API version your operator must support. If
 //! you already depend on `k8s-openapi` directly with a `v1_xx`
 //! feature enabled, you don't need a proxy feature here.
 //!
-//! `kunobi-ha = { version = "0.4", features = ["v1_31"] }`
+//! `kunobi-ha = { version = "0.6.1", features = ["v1_32"] }`
 //!
 //! Library crates that depend on `kunobi-ha` MUST NOT enable any of
 //! these features in their own `[dependencies]` — the choice of
