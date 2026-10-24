@@ -1,6 +1,6 @@
 [package]
 name = "kunobi-ha"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 rust-version = "1.94.1"
 license = "Apache-2.0"
@@ -35,7 +35,7 @@ kube = { version = "4", features = ["client"], default-features = false }
 k8s-openapi = "0.28"
 
 # Async
-tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+tokio = { version = "1.54.1", features = ["rt", "macros", "sync", "time"] }
 
 # Time
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
@@ -54,7 +54,7 @@ tracing = "0.1"
 wiremock = "0.6"
 # `signal` for the example; multi-thread runtime + macros for both tests
 # and the example.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "signal"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "test-util", "signal"] }
 anyhow = "1"
 serde_json = "1"
 http = "1"

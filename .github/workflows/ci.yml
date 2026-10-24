@@ -11,6 +11,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -22,12 +25,14 @@ env:
 jobs:
   checks:
     name: Rust Checks
-    runs-on: kunobi-runners
+    runs-on: ubuntu-latest
     container:
       image: rust:1.94.1-bookworm
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Cache cargo
         uses: actions/cache@v6
@@ -99,12 +104,14 @@ jobs:
   # two tools separately.
   deny:
     name: cargo-deny
-    runs-on: kunobi-runners
+    runs-on: ubuntu-latest
     container:
       image: rust:1.94.1-bookworm
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Cache cargo
         uses: actions/cache@v6
         with:
