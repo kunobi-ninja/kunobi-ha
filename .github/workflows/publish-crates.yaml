@@ -34,7 +34,7 @@ jobs:
 
       # The toolchain pinned in .mise.toml, the same one CI tests with.
       - name: Install mise tools
-        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        uses: jdx/mise-action@82a612c5ab8bcda7cc5db6b7e81a8e7584c3dc6e # v5.2.3
         with:
           experimental: true
           install_args: rust
@@ -85,7 +85,7 @@ jobs:
         id: auth
         # v1.0.4 is the first release on the Node 24 runtime; the floating @v1
         # tag still runs on the deprecated Node 20 runtime.
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
 
       - name: Publish kunobi-ha
         if: steps.published.outputs.exists == 'false'
